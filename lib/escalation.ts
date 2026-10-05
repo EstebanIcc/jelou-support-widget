@@ -1,7 +1,7 @@
 import type { EveMessage } from "eve/client";
 
 /**
- * Marca el texto que `/api/escalations/respond` inyecta como turno "user" al
+ * Marca el texto que `el backend (widget_back_end): /escalations/respond` inyecta como turno "user" al
  * reanudar una sesión pausada por un escalamiento (ver ese route handler y la
  * sección "Respuesta del equipo al escalamiento" de agent/instructions.md).
  * eve no tiene forma de mandar ese texto como si fuera un mensaje del propio

@@ -33,8 +33,44 @@
     offset: offset,
   });
 
-  var CLOSED_SIZE = { width: "88px", height: "88px" };
-  var OPEN_SIZE = { width: "min(400px, 100vw)", height: "min(640px, 100vh)" };
+  // El contenedor va con `[position]: offset` y `bottom: offset` (ver mount() más abajo)
+  // — si el ancho/alto se clampeara solo contra 100vw/100vh (sin restar ese offset), en
+  // una pantalla angosta con un data-offset distinto de 0 el contenedor terminaba más
+  // ancho/alto que el espacio real disponible entre su borde offseteado y el borde
+  // opuesto del viewport, y se salía de la pantalla por el lado contrario (por ejemplo,
+  // con offset="16px" en un celular de 375px, min(400px, 100vw) daba 375px, pero
+  // posicionado con right:16px eso arrancaba 16px afuera del borde izquierdo). Restar el
+  // offset en el propio calc() del clamp asegura que el contenedor SIEMPRE entre entero
+  // en el viewport, sin importar el ancho de pantalla ni el offset configurado.
+  var CLOSED_SIZE = {
+    width: "min(88px, calc(100vw - " + offset + "))",
+    height: "min(88px, calc(100vh - " + offset + "))",
+  };
+  // 420 de ancho: coincide con el panel abierto ("preset Large", ver el className del
+  // panel en components/chat-widget.tsx — w-[min(420px,...)]). Un iframe siempre recorta
+  // su contenido a su propio tamaño, así que si este contenedor fuera más angosto que el
+  // panel de adentro, se verían los 20px de más directamente cortados — no es un
+  // problema de "responsive" en pantallas chicas (ahí min() ya lo resuelve), pasaba
+  // siempre, en cualquier pantalla lo bastante ancha para llegar al tamaño objetivo.
+  //
+  // 772 de alto, NO 680: el panel comparte el contenedor flex-col con el botón flotante
+  // (ver el className del panel, mismo comentario ahí) — adentro de este iframe, ese
+  // contenedor SIEMPRE usa los offsets "mobile" (bottom-4/inset-x-4 = 16px), porque el
+  // iframe nunca llega a los 640px del breakpoint `sm:` de Tailwind. 772 = 680 (panel) +
+  // 48 (botón, size-12) + 12 (gap-3) + 16 (offset inferior) + 16 (margen simétrico
+  // arriba) — si el contenedor fuera solo 680, el panel + botón entre los dos ya no
+  // entraban, y el panel se recortaba contra el borde de arriba del iframe.
+  var OPEN_SIZE = {
+    width: "min(420px, calc(100vw - " + offset + "))",
+    height: "min(772px, calc(100vh - " + offset + "))",
+  };
+  // Tamaño intermedio: panel cerrado pero con la burbuja "el agente respondió" asomando
+  // (ver AgentReplyToast en components/chat-widget.tsx) — necesita más lugar que el botón
+  // solo (CLOSED_SIZE) pero no tanto como el panel abierto.
+  var PEEK_SIZE = {
+    width: "min(340px, calc(100vw - " + offset + "))",
+    height: "min(180px, calc(100vh - " + offset + "))",
+  };
 
   function buildWidgetUrl() {
     var url = new URL("/widget", origin);
@@ -73,7 +109,7 @@
       if (event.source !== iframe.contentWindow) return;
       var data = event.data;
       if (!data || data.source !== "jelou-widget" || data.type !== "resize") return;
-      var size = data.open ? OPEN_SIZE : CLOSED_SIZE;
+      var size = data.open ? OPEN_SIZE : data.peek ? PEEK_SIZE : CLOSED_SIZE;
       container.style.width = size.width;
       container.style.height = size.height;
     });

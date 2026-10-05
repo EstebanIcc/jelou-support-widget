@@ -1,14 +1,12 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { NextConfig } from "next";
-import { withEve } from "eve/next";
 
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 
 // Dominios autorizados a embeber /widget en un <iframe>, resuelto en build time
 // (Vercel: cambiar esta env var requiere redeploy para tomar efecto). Vacío = abierto
-// a cualquier origen. No usamos middleware.ts para esto porque eve empaqueta la app
-// como "service" en Vercel y ese runtime no soporta Edge Functions (_middleware) ahí.
+// a cualquier origen.
 const allowedEmbedOrigins = (process.env.ALLOWED_EMBED_ORIGINS ?? "")
   .split(",")
   .map((origin) => origin.trim())
@@ -31,4 +29,4 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default withEve(nextConfig);
+export default nextConfig;

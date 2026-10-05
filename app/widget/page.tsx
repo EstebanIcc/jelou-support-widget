@@ -1,5 +1,5 @@
-import { lookupUserContext } from "@/agent/lib/jelou-gateway";
 import { firstName } from "@/lib/utils";
+import { lookupUserContext } from "@/lib/backend-user-context";
 
 import { WidgetBackground } from "./widget-background";
 import { WidgetClient } from "./widget-client";
@@ -11,11 +11,13 @@ type SearchParams = { [key: string]: string | string[] | undefined };
  * public/widget-loader.js). No lleva nada de la landing/demo — solo el widget.
  *
  * Server Component (no "use client"): si el sitio embebedor pasó `?email=...` (desde
- * `data-email` en el loader), resolvemos el nombre acá mismo, server-side, para poder
- * mostrarle un saludo personalizado al widget sin que el navegador tenga que pedirlo por
- * su cuenta. El lookup real de compañía para el agente (con más detalle) ya corre aparte,
- * en agent/channels/eve.ts vía el header que ChatWidget manda a eve — esto es solo para
- * tener el nombre disponible en la UI antes de que exista ninguna conversación.
+ * `data-email` en el loader), resolvemos el nombre acá mismo, server-side, contra el
+ * backend (widget_back_end, endpoint /internal/user-context — ver
+ * lib/backend-user-context.ts) para poder mostrarle un saludo personalizado al widget
+ * sin que el navegador tenga que pedirlo por su cuenta. El lookup real de compañía
+ * para el agente (con más detalle) ya corre aparte, en el backend, vía el header que
+ * ChatWidget manda a eve — esto es solo para tener el nombre disponible en la UI antes
+ * de que exista ninguna conversación.
  */
 export default async function WidgetPage({
   searchParams,
@@ -34,7 +36,7 @@ export default async function WidgetPage({
   // <iframe> a partir de los data-* del script tag — ver public/widget-loader.js). Sirve
   // para confirmar, del lado del servidor, que el sitio que integra el widget está
   // mandando lo que cree que está mandando, antes de que nada de esto siga camino al
-  // agente (ver también los logs [widget-user-auth] en agent/channels/eve.ts).
+  // agente (ver también los logs [widget-user-auth] en el backend).
   console.log(
     `[widget] params recibidos: title=${title ?? "(vacío)"} subtitle=${subtitle ?? "(vacío)"} email=${email ?? "(vacío)"} sessionId=${sessionId ?? "(vacío)"}`,
   );
@@ -46,7 +48,7 @@ export default async function WidgetPage({
       <WidgetBackground />
       <WidgetClient
         email={email}
-        name={firstName(context?.user.names)}
+        name={firstName(context?.name)}
         sessionId={sessionId}
         subtitle={subtitle}
         title={title}

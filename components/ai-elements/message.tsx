@@ -276,8 +276,12 @@ const streamdownPlugins = { cjk, code, math, mermaid };
 export const MessageResponse = memo(
   ({ className, ...props }: MessageResponseProps) => (
     <Streamdown
-      className={cn("size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
+      className={cn("size-full space-y-2 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
       plugins={streamdownPlugins}
+      // Sin el modal de confirmación que Streamdown muestra por defecto antes de abrir
+      // un link (linkSafety.enabled) — no hace falta acá, los links van directo en una
+      // pestaña nueva como cualquier <a target="_blank">.
+      linkSafety={{ enabled: false }}
       {...props}
     />
   ),
