@@ -2,10 +2,14 @@
 
 import type { HandleMessageStreamEvent } from "eve/client";
 import { Client } from "eve/client";
+import type { EveDynamicToolPart, EveMessage } from "eve/react";
 import { useEveAgent } from "eve/react";
 import type { UserContent } from "ai";
 import {
   AlertCircleIcon,
+  ArrowLeftIcon,
+  HistoryIcon,
+  Loader2Icon,
   MessageCircleIcon,
   MicIcon,
   PaperclipIcon,
@@ -16,9 +20,11 @@ import {
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
   type CSSProperties,
   type FormEvent,
   type KeyboardEvent,
@@ -26,6 +32,7 @@ import {
 } from "react";
 
 import { AgentMessage } from "@/app/_components/agent-message";
+import { JelouIsotype } from "@/components/ui/jelou-isotype";
 import {
   Conversation,
   ConversationContent,
@@ -34,20 +41,30 @@ import {
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { ChatAttachmentList } from "@/components/chat-attachment-list";
+import { ConversationList } from "@/components/conversation-list";
 import { useChatAttachments } from "@/components/use-chat-attachments";
 import {
+  clearPersistedChat,
   readPersistedChat,
   useEveChatWatcher,
   writePersistedChat,
 } from "@/components/use-eve-chat-sync";
-import { isEscalationReplyMessage } from "@/lib/escalation";
-import { Marker, MarkerContent } from "@/components/ui/marker";
+import { ANALIZADOR_REPLY_PREFIX, isAnalizadorReplyMessage } from "@/lib/analizador-reply";
 import {
-  Message,
-  MessageAvatar,
-  MessageContent,
-} from "@/components/ui/message";
+  buildResumeContextMessage,
+  fetchConversationTranscript,
+  fetchRecentConversations,
+  RESUME_CONTEXT_MARKER_PREFIX,
+  type ConversationSummary,
+  type ConversationTranscriptMessage,
+} from "@/lib/conversation-history";
+import { ESCALATION_REPLY_PREFIX, isEscalationReplyMessage } from "@/lib/escalation";
+import { useAnalizadorPoll } from "@/components/use-analizador-poll";
+import { useActiveToolLabel } from "@/components/use-active-tool-label";
+import { Marker, MarkerContent } from "@/components/ui/marker";
+import { Message, MessageContent } from "@/components/ui/message";
 import { cn } from "@/lib/utils";
+import { AnimatePresence, motion } from "motion/react";
 
 type CancellationState = "idle" | "requested" | "cancelling";
 
@@ -56,6 +73,72 @@ type Cancellation = {
   sentTurnId?: string;
   turnId?: string;
 };
+
+// Mensaje de error "bien manejado" (ver punch list) = nunca el texto crudo que devuelve
+// eve/fetch (ej. "Failed to fetch", códigos internos tipo "gateway-timeout: ...") — eso
+// queda solo en consola para debug. Acá se mapea a algo que un usuario del widget pueda
+// entender, distinguiendo el único caso realmente distinto: sin conexión/no llegó al
+// servidor vs. cualquier otra falla del turno.
+function toFriendlyErrorMessage(error: Error): string {
+  const raw = error.message ?? "";
+  if (/failed to fetch|network ?error|load failed|internet_disconnected|net::err_/iu.test(raw)) {
+    return "No pudimos conectar con el servidor. Revisá tu conexión e intentá de nuevo.";
+  }
+  return "Ocurrió un problema al procesar tu mensaje. Intentá de nuevo en un momento.";
+}
+
+/**
+ * Convierte el transcript (ClickHouse, vía fetchConversationTranscript) en objetos con
+ * la forma de EveMessage, para poder renderizar el historial con el mismo AgentMessage
+ * que usa la conversación en vivo — en vez del Bubble/Marker a mano que había antes, que
+ * no mostraba tool calls ni markdown. Ver getConversationTranscript en
+ * widget_back_end/agent/lib/clickhouse.ts y el doc del proyecto
+ * "historial-conversaciones-fidelidad-visual.md" para el porqué completo.
+ *
+ * Conversaciones de antes de este cambio no tienen el output de sus tool calls
+ * guardado — esas tool calls igual se muestran (con su nombre), solo que sin el
+ * detalle que depende del output (p.ej. el estado especial del analizador).
+ */
+function buildHistoricalMessages(
+  messages: readonly ConversationTranscriptMessage[],
+): EveMessage[] {
+  return messages.map((message, index) => {
+    const toolParts: EveDynamicToolPart[] = message.toolCalls.map((call, callIndex) => {
+      const toolCallId = call.toolCallId || `historical-${message.turnId}-${callIndex}`;
+      if (call.isError) {
+        const errorText =
+          typeof call.output === "string"
+            ? call.output
+            : call.output
+              ? JSON.stringify(call.output)
+              : "Ocurrió un error.";
+        return {
+          type: "dynamic-tool",
+          toolCallId,
+          toolName: call.toolName,
+          state: "output-error",
+          input: undefined,
+          errorText,
+        };
+      }
+      return {
+        type: "dynamic-tool",
+        toolCallId,
+        toolName: call.toolName,
+        state: "output-available",
+        input: undefined,
+        output: call.output ?? {},
+      };
+    });
+
+    return {
+      id: `historical-${message.turnId}-${message.role}-${index}`,
+      role: message.role === "user" ? "user" : "assistant",
+      parts: [{ type: "text", text: message.content }, ...toolParts],
+      metadata: { turnId: message.turnId, status: "complete" },
+    };
+  });
+}
 
 export type ChatWidgetProps = {
   title?: string;
@@ -71,7 +154,7 @@ export type ChatWidgetProps = {
   email?: string;
   /**
    * Nombre de pila del visitante, si ya se conoce (ver app/widget/page.tsx y app/page.tsx,
-   * que lo resuelven server-side con el mismo email vía agent/lib/jelou-gateway.ts). Solo
+   * que lo resuelven server-side con el mismo email vía widget_back_end/agent/lib/jelou-gateway.ts). Solo
    * se usa para el saludo inicial en la UI — no viaja a eve ni al modelo por acá; ese
    * contexto lo resuelve el agente por su cuenta a partir del header `email` (ver prop de
    * arriba). Si no se pasa, el saludo queda genérico, sin nombre.
@@ -82,7 +165,7 @@ export type ChatWidgetProps = {
    * correo (ver data-session-id en public/widget-loader.js). No es el session.id interno
    * de eve — viaja como header a agent/channels/eve.ts, que lo guarda en
    * attributes.sessionId para que agent/sandbox.ts lo use, junto al companyId ya resuelto,
-   * al pedir el api-key dinámico del CLI (ver agent/lib/support-widget-service.ts). Sin
+   * al pedir el api-key dinámico del CLI (ver widget_back_end/agent/lib/support-widget-service.ts). Sin
    * este dato el analizador queda inutilizable para esa sesión, pero el chat funciona
    * igual.
    */
@@ -132,22 +215,39 @@ export function ChatWidget({
   sessionId,
 }: ChatWidgetProps) {
   const [open, setOpen] = useState(false);
+  // Aviso "el agente respondió" con el panel minimizado (ver AgentReplyToast más abajo):
+  // el iframe necesita agrandarse un toque para que la burbuja no quede recortada por
+  // public/widget-loader.js, que por defecto solo reserva 88x88 (el botón solo).
+  const [peek, setPeek] = useState(false);
   const { generation, reportIdle } = useEveChatWatcher(STORAGE_KEY);
 
   // Cuando corre embebido en un <iframe> (ver app/widget/page.tsx +
   // public/widget-loader.js), avisa a la página que lo contiene si el panel está
-  // abierto o cerrado, para que el loader pueda redimensionar el iframe: chico
-  // (solo el botón) cuando está cerrado, grande (botón + panel) cuando está abierto.
+  // abierto o cerrado (o si hay un aviso de respuesta asomando con el panel cerrado),
+  // para que el loader pueda redimensionar el iframe: chico (solo el botón) cuando está
+  // cerrado, un poco más alto mientras se ve el aviso, grande (botón + panel) abierto.
   useEffect(() => {
     if (typeof window === "undefined" || window.self === window.top) return;
-    window.parent.postMessage({ source: "jelou-widget", type: "resize", open }, "*");
-  }, [open]);
+    window.parent.postMessage(
+      { source: "jelou-widget", type: "resize", open, peek },
+      "*",
+    );
+  }, [open, peek]);
 
   return (
     <ChatWidgetInner
       key={generation}
       email={email}
+      // Solo el primer montaje real (carga de página) anima el scroll inicial de
+      // Conversation. Un remount con generation > 0 lo dispara el watcher de
+      // use-eve-chat-sync.ts al detectar una respuesta externa (ej. el equipo
+      // respondiendo un escalamiento vía POST /escalations/respond) — ahí el usuario
+      // ya está viendo la conversación, así que animar un scroll "smooth" hace que se
+      // vea como si la página se fuera arriba y después volviera. Con "instant" el
+      // remount reubica el scroll al fondo sin ese salto visible.
+      initialScroll={generation === 0 ? "smooth" : "instant"}
       name={name}
+      onPeekChange={setPeek}
       open={open}
       reportIdle={reportIdle}
       sessionId={sessionId}
@@ -160,7 +260,9 @@ export function ChatWidget({
 
 function ChatWidgetInner({
   email,
+  initialScroll,
   name,
+  onPeekChange,
   open,
   reportIdle,
   sessionId,
@@ -168,6 +270,8 @@ function ChatWidgetInner({
   subtitle,
   title,
 }: ChatWidgetProps & {
+  readonly initialScroll: "instant" | "smooth";
+  readonly onPeekChange: (peek: boolean) => void;
   readonly open: boolean;
   readonly reportIdle: (idle: boolean) => void;
   readonly setOpen: (value: boolean | ((prev: boolean) => boolean)) => void;
@@ -176,15 +280,155 @@ function ChatWidgetInner({
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Último mensaje mandado (texto o adjuntos), para poder reintentarlo con un clic si el
+  // turno termina en error en vez de obligar a retipear todo — ver handleRetry más abajo.
+  const lastSendRef = useRef<{ message: string | UserContent } | null>(null);
   const {
     attachments,
     addFiles,
     removeAttachment,
     clearAttachments,
+    clearError: clearAttachmentError,
     error: attachmentError,
     isRecording,
     toggleRecording,
   } = useChatAttachments();
+
+  // Vista "Mensajes" (lista de conversaciones de los últimos 7 días, tipo Intercom) —
+  // ver el botón del header más abajo y ConversationList. Solo tiene sentido si hay
+  // `email` (GET /conversations necesita identificar al visitante, igual que el resto
+  // del chat — ver lib/conversation-history.ts).
+  const [view, setView] = useState<"chat" | "list">("chat");
+  const [conversations, setConversations] = useState<
+    readonly ConversationSummary[]
+  >([]);
+  const [conversationsStatus, setConversationsStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  // sessionId (no email) de la conversación pasada que se está cargando en este
+  // momento al hacer click en la lista — deshabilita la lista mientras tanto (ver
+  // ConversationList) y distingue "cargando esta fila" de "cargando la lista".
+  const [resumingSessionId, setResumingSessionId] = useState<string | null>(
+    null,
+  );
+  // Transcript (solo texto) de la conversación elegida, para mostrarlo como historial
+  // de solo lectura arriba de la conversación nueva (ver ConversationContent más
+  // abajo) — se arma una sesión de eve nueva porque una sesión "completed" no se puede
+  // reabrir (ver node_modules/eve/docs/guides/client/continuations.mdx, "Waiting,
+  // completed, and failed sessions"), así que esto es la única forma de que el
+  // historial viejo siga visible.
+  const [resumedTranscript, setResumedTranscript] = useState<
+    readonly ConversationTranscriptMessage[] | null
+  >(null);
+  // sessionId de la conversación retomada — para que el feedback (ver
+  // MessageActionsRow, que manda eveSessionId al dar thumbs up/down) quede asociado a
+  // la sesión real de esos mensajes, no a la sesión nueva que arranca al retomar.
+  const [resumedSessionId, setResumedSessionId] = useState<string | null>(null);
+  // Mismos objetos EveMessage que arma useEveAgent para la conversación en vivo (ver
+  // buildHistoricalMessages más arriba) — así el historial se renderiza con el mismo
+  // AgentMessage, en vez de un render aparte y más simple.
+  const historicalMessages = useMemo(
+    () => (resumedTranscript ? buildHistoricalMessages(resumedTranscript) : []),
+    [resumedTranscript],
+  );
+  // Bloque de contexto oculto (ver buildResumeContextMessage) pendiente de anteponer
+  // al PRÓXIMO mensaje que el usuario escriba — no se manda solo al elegir la
+  // conversación porque eso sería un turno que el usuario nunca pidió; se agrega recién
+  // cuando él mismo decide seguir escribiendo (ver handleSubmit).
+  const pendingResumeContextRef = useRef<string | undefined>(undefined);
+
+  const loadConversations = useCallback(async () => {
+    if (!email) return;
+    setConversationsStatus("loading");
+    try {
+      const items = await fetchRecentConversations(email);
+      setConversations(items);
+      setConversationsStatus("ready");
+    } catch (error) {
+      console.error(
+        "[jelou-widget] no se pudieron cargar las conversaciones anteriores:",
+        error,
+      );
+      setConversationsStatus("error");
+    }
+  }, [email]);
+
+  const openConversationList = () => {
+    setView("list");
+    void loadConversations();
+  };
+
+  const handleSelectConversation = async (sessionId: string) => {
+    if (!email || resumingSessionId) return;
+    setResumingSessionId(sessionId);
+    try {
+      const rawMessages = await fetchConversationTranscript(sessionId, email);
+      // Si esta conversación ya se había retomado antes, el bloque oculto que
+      // handleSubmit le antepuso a aquel primer mensaje (ver más abajo) quedó
+      // persistido en ClickHouse como un mensaje más — widget_back_end/agent/hooks/persist-analytics.ts
+      // registra el contenido tal cual se lo manda a eve, sin distinguir texto oculto
+      // de texto real. Sin este filtro aparecía como una burbuja con el dump crudo
+      // ("[Contexto de conversación anterior]\nUsuario: ...\nAgente: ...") en vez de
+      // verse como una conversación real — y si se volvía a usar para construir el
+      // contexto del próximo resume, cada resume sucesivo anidaba el dump del
+      // anterior adentro del nuevo, cada vez más grande.
+      // Además del contexto de resume, el transcript persistido en ClickHouse incluye
+      // cualquier otro turno "user" sintético que la UI en vivo esconde (ver
+      // visibleMessages más abajo): la respuesta tardía del analizador
+      // (ANALIZADOR_REPLY_PREFIX) y la respuesta de un escalamiento
+      // (ESCALATION_REPLY_PREFIX). Sin filtrarlos aquí también, el historial
+      // retomado los mostraba como si el usuario los hubiera escrito — pasaba en
+      // cualquier conversación con uno de estos turnos, sin importar qué tan vieja
+      // fuera ni si tenía o no la metadata de tool_result.
+      const messages = rawMessages.filter(
+        (message) =>
+          !message.content.startsWith(RESUME_CONTEXT_MARKER_PREFIX) &&
+          !message.content.startsWith(ANALIZADOR_REPLY_PREFIX) &&
+          !message.content.startsWith(ESCALATION_REPLY_PREFIX),
+      );
+      // Antes de mostrar el historial elegido, se limpia la conversación en curso que
+      // estaba cacheada (en memoria y en localStorage, ver use-eve-chat-sync.ts) — si
+      // no, visibleMessages (los mensajes "vivos" de la sesión actual, ver más abajo)
+      // seguían renderizándose debajo del historial nuevo, y como son los más
+      // recientes/los que quedan a la vista, en la práctica tapaban la conversación
+      // que se acababa de elegir y parecía que no había pasado nada. agent.reset() no
+      // toca la sesión de eve en sí (sigue siendo la misma, con su propio cursor del
+      // lado del servidor — eso es justamente lo que permite retomarla con contexto
+      // más abajo en handleSubmit), solo vacía lo que se está mostrando en pantalla.
+      clearPersistedChat(STORAGE_KEY);
+      agent.reset();
+      prepareTurn();
+      setResumedTranscript(messages);
+      setResumedSessionId(sessionId);
+      pendingResumeContextRef.current = buildResumeContextMessage(messages);
+      setView("chat");
+    } catch (error) {
+      console.error(
+        "[jelou-widget] no se pudo cargar la conversación anterior:",
+        error,
+      );
+    } finally {
+      setResumingSessionId(null);
+    }
+  };
+
+  // Botón "Hacer una pregunta" en el footer de la lista de conversaciones (ver
+  // ConversationList más abajo) — mismo tipo de limpieza que handleSelectConversation
+  // (vaciar lo que esté cacheado/mostrado), pero sin cargar ningún transcript: deja la
+  // vista "chat" lista para un mensaje nuevo, sin el overlay de "Conversación anterior"
+  // ni el contexto oculto de un resume pendiente, por si el usuario entró a la lista
+  // desde una conversación retomada.
+  const handleStartNewConversation = () => {
+    if (resumingSessionId) return;
+    clearPersistedChat(STORAGE_KEY);
+    agent.reset();
+    prepareTurn();
+    setResumedTranscript(null);
+    setResumedSessionId(null);
+    pendingResumeContextRef.current = undefined;
+    setView("chat");
+    inputRef.current?.focus();
+  };
 
   // El header con el email va acá, en el Client que arma la sesión — no en las opciones
   // de useEveAgent más abajo. EveAgentStore solo aplica su propio `headers`/`auth` cuando
@@ -201,7 +445,8 @@ function ChatWidgetInner({
               ...(sessionId ? { "x-jelou-session-id": sessionId } : {}),
             }
           : undefined,
-      host: "",
+      // Backend separado (ver widget_back_end/): antes era same-origin ("").
+      host: process.env.NEXT_PUBLIC_EVE_BACKEND_URL ?? "",
       preserveCompletedSessions: true,
     }).session(saved.session),
   );
@@ -262,15 +507,59 @@ function ChatWidgetInner({
     },
     session,
   });
+  // Mientras haya una investigación del analizador "en_progreso", pregunta en segundo
+  // plano si ya hay respuesta y la inyecta sola apenas llegue (ver
+  // components/use-analizador-poll.ts y "Respuesta tardía del analizador" en
+  // agent/instructions.md).
+  useAnalizadorPoll(agent, session);
+  // Texto del indicador "trabajando" de abajo — refleja la tool activa en vez de un
+  // texto fijo (ver components/use-active-tool-label.ts).
+  const activeToolLabel = useActiveToolLabel(agent.data.messages);
+
   const isBusy = agent.status === "submitted" || agent.status === "streaming";
-  // El turno "user" que /api/escalations/respond inyecta al reanudar un escalamiento
-  // no lo escribió el usuario — se oculta para que solo se vea la respuesta que el
-  // agente genera a partir de él (ver lib/escalation.ts).
+  // El turno "user" que el backend (widget_back_end): /escalations/respond (o el polling del analizador, ver
+  // arriba) inyecta al reanudar la conversación no lo escribió el usuario — se oculta
+  // para que solo se vea la respuesta que el agente genera a partir de él (ver
+  // lib/escalation.ts y lib/analizador-reply.ts).
   const visibleMessages = agent.data.messages.filter(
-    (message) => !isEscalationReplyMessage(message),
+    (message) =>
+      !isEscalationReplyMessage(message) && !isAnalizadorReplyMessage(message),
   );
   const isEmpty = visibleMessages.length === 0;
-  const errorMessage = cancellationError ?? agent.error?.message;
+  // El indicador "trabajando" de abajo (Pensando…/Buscando en la documentación…, ver
+  // más abajo) solo tapa el hueco antes de que exista algo del mensaje nuevo para
+  // mostrar — apenas el último mensaje visible ya tiene texto o un tool call, ese
+  // contenido (con su propio shimmer, ver ToolCallHistory/ToolPart en agent-message.tsx)
+  // ya comunica "en curso" por sí solo. Sin este chequeo quedaban los dos a la vez, un
+  // estado "en curso" duplicado que además podía seguir un instante después de que el
+  // mensaje ya se viera completo.
+  const lastVisibleMessage = visibleMessages[visibleMessages.length - 1];
+  const lastMessageHasVisibleContent =
+    lastVisibleMessage?.role === "assistant" &&
+    lastVisibleMessage.parts.some(
+      (part) => part.type === "text" || part.type === "dynamic-tool",
+    );
+  // Nunca se muestra agent.error?.message / cancellationError tal cual — ver
+  // toFriendlyErrorMessage arriba. El crudo solo va a consola, para debug.
+  useEffect(() => {
+    if (agent.error) {
+      console.error("[jelou-widget] eve agent error:", agent.error);
+    }
+  }, [agent.error]);
+  const errorMessage = cancellationError
+    ? "No pudimos detener la respuesta. Es posible que ya haya terminado."
+    : agent.error
+      ? toFriendlyErrorMessage(agent.error)
+      : undefined;
+  // "Reintentar" solo tiene sentido cuando lo que falló fue el turno en sí (no un intento
+  // de cancelar) y tenemos guardado qué mandar de nuevo.
+  const canRetry = !cancellationError && agent.error !== undefined && lastSendRef.current !== null;
+  const handleRetry = () => {
+    const last = lastSendRef.current;
+    if (!last || isBusy) return;
+    prepareTurn();
+    void agent.send(last);
+  };
   // Ver comentario igual en agent-chat.tsx: ids ya presentes al montar (historial), para
   // decidir si un mensaje debe animarse sin depender del timing exacto de isStreaming.
   const initialMessageIdsRef = useRef<Set<string> | null>(null);
@@ -289,6 +578,56 @@ function ChatWidgetInner({
   useEffect(() => {
     reportIdle(agent.status === "ready");
   }, [agent.status, reportIdle]);
+
+  // Aviso "el agente respondió" con el panel minimizado (ver AgentReplyToast más abajo):
+  // si el usuario cerró el widget pero sigue en la pestaña y llega una respuesta nueva
+  // —ya sea de un turno normal o de una que se inyecta sola más tarde (escalamiento
+  // resuelto, ver use-eve-chat-sync.ts, o el fallback del analizador, ver
+  // use-analizador-poll.ts: ambas terminan pasando por un turno normal de `agent`, por
+  // eso alcanza con mirar la transición de isBusy acá)— se avisa con una burbuja junto al
+  // botón flotante en vez de perderse en silencio. Fuera de alcance a propósito: avisar
+  // con la pestaña en segundo plano o el navegador cerrado (Notification API / push real)
+  // — ver la conversación donde se acotó esto.
+  const wasBusyRef = useRef(false);
+  const [toast, setToast] = useState<{ id: string; preview: string } | null>(null);
+
+  useEffect(() => {
+    const justFinished = wasBusyRef.current && !isBusy;
+    wasBusyRef.current = isBusy;
+    if (!justFinished || open) return;
+
+    const lastMessage = visibleMessages[visibleMessages.length - 1];
+    if (!lastMessage || lastMessage.role !== "assistant") return;
+
+    const text = lastMessage.parts
+      .filter((part) => part.type === "text")
+      .map((part) => ("text" in part ? part.text : ""))
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim();
+    const preview =
+      text.length > 90
+        ? `${text.slice(0, 90).trimEnd()}…`
+        : text || "Tenés una respuesta nueva.";
+
+    setToast({ id: lastMessage.id, preview });
+  }, [isBusy, open, visibleMessages]);
+
+  // El usuario abrió el chat (desde la burbuja o desde el botón flotante) — ya la vio.
+  useEffect(() => {
+    if (open) setToast(null);
+  }, [open]);
+
+  // Se cierra sola si nadie la toca, para no quedar pegada en la página del cliente.
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 8_000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  useEffect(() => {
+    onPeekChange(toast !== null);
+  }, [toast, onPeekChange]);
 
   const prepareTurn = () => {
     cancellationRef.current = { requested: false };
@@ -320,13 +659,22 @@ function ChatWidgetInner({
     setInput("");
     const files = attachments;
     clearAttachments();
+    // Se consume una sola vez: si el usuario "retomó" una conversación pasada, este
+    // primer envío (con o sin adjuntos) le antepone el contexto oculto; el resto de la
+    // conversación sigue como un chat normal (ver handleSelectConversation arriba).
+    const resumeContext = pendingResumeContextRef.current;
+    pendingResumeContextRef.current = undefined;
 
-    if (files.length === 0) {
+    if (files.length === 0 && !resumeContext) {
+      lastSendRef.current = { message: text };
       await agent.send({ message: text });
       return;
     }
 
     const parts: UserContent = [];
+    if (resumeContext) {
+      parts.push({ text: resumeContext, type: "text" });
+    }
     if (text.length > 0) {
       parts.push({ text, type: "text" });
     }
@@ -337,7 +685,15 @@ function ChatWidgetInner({
         mediaType: file.mediaType,
         type: "file",
       });
+      // Además de la imagen en sí (para que el modelo la "vea"), le mandamos su URL
+      // pública como texto plano citable — el modelo no puede transcribir el contenido
+      // de una imagen que ve, pero sí puede repetir esta URL si decide escalar el caso
+      // (ver widget_back_end/agent/tools/escalar.ts, campo `imagenes`, y use-chat-attachments.ts).
+      if (file.mediaUrl) {
+        parts.push({ text: `[Imagen adjunta: ${file.mediaUrl}]`, type: "text" });
+      }
     }
+    lastSendRef.current = { message: parts };
     await agent.send({ message: parts });
   };
 
@@ -347,6 +703,21 @@ function ChatWidgetInner({
     }
     event.preventDefault();
     event.currentTarget.form?.requestSubmit();
+  };
+
+  // Pegar una imagen (Ctrl+V/Cmd+V con algo copiado, p.ej. un screenshot) la adjunta
+  // igual que si se hubiera elegido desde el explorador de archivos — mismo pipeline
+  // (Data URL + subida al backend (widget_back_end): /attachments/upload-image, ver use-chat-attachments.ts). Si
+  // el portapapeles no trae ningún archivo de imagen (paste de texto normal), no se
+  // intercepta nada — el pegado de texto sigue funcionando como siempre.
+  const handleInputPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageFiles = Array.from(event.clipboardData?.items ?? [])
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (imageFiles.length === 0) return;
+    event.preventDefault();
+    void addFiles(imageFiles);
   };
 
   const handleFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -374,13 +745,27 @@ function ChatWidgetInner({
       `}</style>
 
       <div
-        aria-label={title}
+        aria-label="Jelou"
         className={cn(
           // Tamaño fijo (420x680, preset "Large") en vez de responsivo — el widget
           // siempre abre con esta misma medida exacta. El min() con el viewport es
           // solo un tope de seguridad para que no se corte en pantallas realmente
-          // chicas (celulares), no cambia el tamaño objetivo.
-          "jelou-notepad-widget pointer-events-auto flex h-[min(680px,calc(100vh-2rem))] w-[min(420px,calc(100vw-2rem))] origin-bottom-right flex-col overflow-hidden rounded-[20px] shadow-xl transition-all duration-200",
+          // chicas (celulares), no cambia el tamaño objetivo. "group" habilita el botón
+          // de cerrar de abajo, que solo se ve con hover sobre el panel.
+          //
+          // El resto de -Npx de cada calc() NO es el mismo "2rem" de siempre: este panel
+          // comparte el contenedor flex-col con el botón flotante de abajo (ver el div
+          // "fixed inset-x-4 bottom-4 ... flex flex-col items-end gap-3" que envuelve
+          // todo esto), así que el alto que le sobra a la ventana tiene que alcanzar
+          // también para ese botón (size-12 = 48px) + el gap-3 (12px) + el offset inferior
+          // del contenedor (bottom-4 = 16px en mobile, sm:bottom-6 = 24px desde sm) + un
+          // margen simétrico arriba (16px/24px). Con un simple "-2rem" (32px) ese resto no
+          // le alcanzaba a nada más que al propio panel, así que en pantallas no muy altas
+          // el conjunto completo (panel + botón) terminaba más alto que la ventana y se
+          // recortaba contra el borde de arriba, sin margen ni esquina redondeada visibles
+          // ahí — exactamente el bug reportado. 92px = 48+12+16+16 (mobile). 108px =
+          // 48+12+24+24 (desde sm, cuando el offset del contenedor pasa a bottom-6).
+          "jelou-notepad-widget relative pointer-events-auto flex h-[min(680px,calc(100vh-92px))] w-[min(420px,calc(100vw-2rem))] origin-bottom-right flex-col overflow-hidden rounded-[20px] shadow-xl transition-all duration-200 sm:h-[min(680px,calc(100vh-108px))]",
           open
             ? "scale-100 opacity-100"
             : "pointer-events-none scale-95 opacity-0",
@@ -392,42 +777,185 @@ function ChatWidgetInner({
         aria-hidden={!open}
         role="dialog"
       >
-        {/* Sin header ni anillas de cuaderno: el panel arranca directo en el
-            canvas de mensajes para maximizar el espacio vertical. Cerrar sigue
-            disponible desde el botón flotante (siempre visible, fuera de este
-            panel) que alterna abierto/cerrado. */}
-        {errorMessage ? (
+        {/* Header (estructura tomada del de Intercom: avatar + nombre + subtítulo a la
+            izquierda, cerrar a la derecha) — antes el panel arrancaba directo en el
+            canvas de mensajes y el botón de cerrar era uno suelto, flotante, que solo
+            aparecía con hover sobre el panel. title/subtitle son props que ChatWidget ya
+            recibía pero nunca se mostraban en ningún lado. */}
+        <div
+          className="flex shrink-0 items-center gap-2.5 px-3.5 py-3"
+          style={{ borderBottom: "1px solid var(--widget-border-soft)" }}
+        >
+          {/* "Botón de redirección" a la vista "Mensajes" (lista de conversaciones de
+              los últimos 7 días, tipo Intercom) — mismo ícono actúa como "volver al
+              chat" una vez adentro de la lista. Solo aparece con `email`: sin eso el
+              backend no tiene cómo identificar de quién son las conversaciones (ver
+              GET /conversations en widget_back_end). */}
+          {email ? (
+            <button
+              aria-label={
+                view === "list" ? "Volver al chat" : "Ver conversaciones anteriores"
+              }
+              className="flex size-7 shrink-0 items-center justify-center rounded-full text-[var(--widget-text-muted)] transition-colors hover:bg-[var(--widget-border-soft)] hover:text-[var(--widget-text)]"
+              onClick={() =>
+                view === "list" ? setView("chat") : openConversationList()
+              }
+              type="button"
+            >
+              {view === "list" ? (
+                <ArrowLeftIcon className="size-4" />
+              ) : (
+                <HistoryIcon className="size-4" />
+              )}
+            </button>
+          ) : null}
+          {/* Avatar "default" (32px) en vez de "sm" (24px) para agrandar el isotipo
+              del header — se veía chico al lado del título. */}
+          <Avatar size="default">
+            <AvatarFallback className="bg-transparent">
+              <JelouIsotype size={26} />
+            </AvatarFallback>
+          </Avatar>
+          <div className="min-w-0 flex-1">
+            {/* El título del header ahora es siempre "Jelou" (fijo, no usa la prop
+                `title`) y el subtítulo se eliminó del todo — antes variaban según
+                `title`/`subtitle` (ver ChatWidgetProps más arriba, que llegaban desde el
+                theme/embedding config: app/widget/page.tsx, public/widget-loader.js,
+                etc.). Las props se dejan intactas para no romper esos call sites, solo
+                dejaron de usarse acá. */}
+            <p
+              className="truncate text-sm font-semibold"
+              style={{ color: "var(--widget-text)" }}
+            >
+              Jelou
+            </p>
+          </div>
+          <button
+            aria-label="Cerrar chat"
+            className="flex size-7 shrink-0 items-center justify-center rounded-full text-[var(--widget-text-muted)] transition-colors hover:bg-[var(--widget-border-soft)] hover:text-[var(--widget-text)]"
+            onClick={() => setOpen(false)}
+            type="button"
+          >
+            <XIcon className="size-4" />
+          </button>
+        </div>
+
+        {view === "list" ? (
+          <ConversationList
+            conversations={conversations}
+            onRetry={loadConversations}
+            onSelect={handleSelectConversation}
+            resumingSessionId={resumingSessionId}
+            status={conversationsStatus}
+          />
+        ) : null}
+
+        {/* Footer fijo de la vista "Mensajes": antes no había ninguna forma de arrancar
+            una conversación nueva desde acá — solo se podía volver al chat en curso (el
+            botón del header) o reabrir una de las anteriores. Shrink-0, siempre visible
+            (incluso con la lista vacía o en error), para que "preguntar algo nuevo" sea
+            una salida siempre disponible desde esta vista. */}
+        {view === "list" ? (
+          <div
+            className="shrink-0 p-3"
+            style={{ borderTop: "1px solid var(--widget-border-soft)" }}
+          >
+            {/* Mismo patrón que el botón "Hacer una pregunta" de Intercom (texto +
+                ícono a la derecha) pero con el isotipo de Jelou en vez de su flecha.
+                Fondo blanco y ancho ajustado al contenido (ya no w-full ni accent de
+                fondo) — con fondo blanco el isotipo (su propio cyan fijo, #00B3C7, ver
+                jelou-isotype.tsx) ya tiene contraste de sobra solo, sin necesitar el
+                chip blanco de antes; el borde es lo que lo separa del panel, que
+                también es blanco (--widget-paper). */}
+            <button
+              className="mx-auto flex items-center justify-center gap-2 rounded-full px-4 py-1.5 text-xs font-medium transition-opacity hover:opacity-90"
+              onClick={handleStartNewConversation}
+              style={{
+                backgroundColor: "#FFFFFF",
+                border: "1px solid var(--widget-border)",
+                color: "var(--widget-accent)",
+              }}
+              type="button"
+            >
+              Hacer una pregunta
+              <JelouIsotype size={20} />
+            </button>
+          </div>
+        ) : null}
+
+        {view === "chat" && errorMessage ? (
           <div className="shrink-0 border-b border-destructive/20 bg-destructive/5 px-3 py-2">
             <div className="flex items-start gap-2 text-xs">
               <AlertCircleIcon className="mt-0.5 size-3.5 shrink-0 text-destructive" />
-              <p className="text-muted-foreground">{errorMessage}</p>
+              <div className="min-w-0 flex-1">
+                <p className="text-muted-foreground">{errorMessage}</p>
+                {canRetry ? (
+                  <button
+                    className="mt-0.5 font-medium text-destructive underline-offset-2 hover:underline"
+                    onClick={handleRetry}
+                    type="button"
+                  >
+                    Reintentar
+                  </button>
+                ) : null}
+              </div>
             </div>
           </div>
         ) : null}
 
+        {view === "chat" ? (
         <div className="flex min-h-0 flex-1 flex-col">
           {/* Ver comentario igual en agent-chat.tsx: Conversation (use-stick-to-bottom)
               en vez de @shadcn/react/message-scroller — sigue el contenido con física de
               resortes, no scroll-behavior CSS reactivo, y no se traba con el ritmo
               parejo de useLineByLineReveal. Sin anclaje de "pregunta nueva arriba": solo
               sigue el final, que es lo que queríamos. */}
-          <Conversation className="h-full min-h-0 flex-1">
-            <ConversationContent className="gap-4 p-4">
-              {isEmpty ? (
+          <Conversation className="h-full min-h-0 flex-1" initial={initialScroll}>
+            <ConversationContent className="gap-2 p-4">
+              {/* Historial de solo lectura de la conversación "retomada" (ver
+                  handleSelectConversation) — se muestra acá, separado del array de
+                  mensajes de eve, porque la sesión nueva no incluye estos mensajes
+                  (una sesión "completed" no se puede reabrir, ver el comentario en
+                  resumedTranscript más arriba). El contexto real que el agente SÍ lee
+                  va oculto en el próximo mensaje del usuario (ver handleSubmit).
+                  Mismo AgentMessage que la conversación en vivo (ver
+                  historicalMessages/buildHistoricalMessages más arriba) — antes era un
+                  Bubble/Marker a mano, sin tool calls ni markdown, que se veía distinto
+                  a como se vio en vivo. canRespond=false e isStreaming=false siempre:
+                  es historial, no hay nada pendiente de responder ni en curso. */}
+              {resumedTranscript && resumedTranscript.length > 0 ? (
+                <div
+                  className="mb-1 flex flex-col gap-2 pb-3"
+                  style={{ borderBottom: "1px dashed var(--widget-border)" }}
+                >
+                  <p
+                    className="text-center text-[11px] font-medium"
+                    style={{ color: "var(--widget-text-faint)" }}
+                  >
+                    Conversación anterior
+                  </p>
+                  {historicalMessages.map((historyMessage) => (
+                    <AgentMessage
+                      canRespond={false}
+                      eveSessionId={resumedSessionId ?? ""}
+                      isLatestMessage={false}
+                      isNew={false}
+                      isStreaming={false}
+                      key={historyMessage.id}
+                      message={historyMessage}
+                      onInputResponses={() => {}}
+                    />
+                  ))}
+                </div>
+              ) : null}
+
+              {isEmpty && !resumedTranscript ? (
+                // Sin avatar: AgentMessage (el que renderiza las respuestas reales, ver
+                // agent-message.tsx) tampoco lo usa, así que el texto queda alineado
+                // igual desde el primer mensaje — antes el saludo arrancaba corrido ~40px
+                // a la derecha (por el Avatar) y el primer mensaje real aparecía pegado
+                // al borde, lo que se sentía como un salto.
                 <Message align="start">
-                  <MessageAvatar>
-                    <Avatar size="sm">
-                      <AvatarFallback
-                        className="font-semibold"
-                        style={{
-                          backgroundColor: "var(--widget-accent)",
-                          color: "var(--widget-accent-foreground)",
-                        }}
-                      >
-                        J
-                      </AvatarFallback>
-                    </Avatar>
-                  </MessageAvatar>
                   <MessageContent>
                     <Marker>
                       <MarkerContent>
@@ -444,10 +972,24 @@ function ChatWidgetInner({
                 <AgentMessage
                   key={message.id}
                   canRespond={!isBusy}
+                  eveSessionId={session.state.sessionId ?? ""}
+                  isLatestMessage={index === visibleMessages.length - 1}
                   isNew={!initialMessageIdsRef.current?.has(message.id)}
+                  // Comparado contra agent.data.messages (sin filtrar) en vez de
+                  // contra visibleMessages/index: si se compara por índice, mientras el
+                  // analizador resuelve en segundo plano (ver use-analizador-poll.ts),
+                  // el mensaje "reply" oculto que agent.send() agrega queda afuera de
+                  // visibleMessages, así que el ÚLTIMO mensaje VISIBLE sigue siendo el
+                  // mensaje anterior (el que ya había terminado, con su botón de copiar
+                  // ya mostrado) hasta que la respuesta nueva arranca a streamear — eso
+                  // lo marcaba como isStreaming de nuevo y le hacía desaparecer el botón
+                  // de copiar sin que el usuario hiciera nada. Comparando por id contra
+                  // el mensaje crudo más reciente, ese mensaje ya resuelto nunca vuelve a
+                  // marcarse como streaming solo porque hay un turno oculto en curso.
                   isStreaming={
                     agent.status === "streaming" &&
-                    index === visibleMessages.length - 1
+                    message.id ===
+                      agent.data.messages[agent.data.messages.length - 1]?.id
                   }
                   message={message}
                   onInputResponses={(inputResponses) => {
@@ -457,25 +999,35 @@ function ChatWidgetInner({
                 />
               ))}
 
-              {isBusy && cancellationState === "idle" ? (
+              {isBusy && cancellationState === "idle" && !lastMessageHasVisibleContent ? (
+                // Sin avatar, igual que el saludo de arriba: este bloque es el que se
+                // reemplaza en el momento exacto en que llega contenido real (ver
+                // lastMessageHasVisibleContent), y AgentMessage nunca pinta un avatar —
+                // mantenerlo acá hacía que el texto de la respuesta "saltara" ~40px a la
+                // izquierda apenas dejaba de ser el placeholder.
                 <Message align="start">
-                  <MessageAvatar>
-                    <Avatar size="sm">
-                      <AvatarFallback
-                        className="font-semibold"
-                        style={{
-                          backgroundColor: "var(--widget-accent)",
-                          color: "var(--widget-accent-foreground)",
-                        }}
-                      >
-                        J
-                      </AvatarFallback>
-                    </Avatar>
-                  </MessageAvatar>
                   <MessageContent>
                     <Marker role="status">
-                      <MarkerContent className="shimmer">
-                        Consultando docs Jelou…
+                      <MarkerContent>
+                        {/* AnimatePresence con key={activeToolLabel} en mode="wait": al
+                            cambiar de tool (p.ej. "Pensando…" → "Buscando en la
+                            documentación" → "Investigando tu caso…") el texto viejo
+                            termina de desvanecerse antes de que entre el nuevo — con el
+                            modo por default ("sync") los dos coexisten en el DOM durante
+                            el crossfade, lo que ensancha la línea un instante y corre
+                            cualquier cosa que venga después. */}
+                        <AnimatePresence initial={false} mode="wait">
+                          <motion.span
+                            key={activeToolLabel}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="shimmer inline-block"
+                            exit={{ opacity: 0, y: -4 }}
+                            initial={{ opacity: 0, y: 4 }}
+                            transition={{ duration: 0.18, ease: "easeOut" }}
+                          >
+                            {activeToolLabel}
+                          </motion.span>
+                        </AnimatePresence>
                       </MarkerContent>
                     </Marker>
                   </MessageContent>
@@ -485,7 +1037,9 @@ function ChatWidgetInner({
             <ConversationScrollButton />
           </Conversation>
         </div>
+        ) : null}
 
+        {view === "chat" ? (
         <form
           onSubmit={handleSubmit}
           className="flex shrink-0 flex-col gap-1.5 p-4"
@@ -497,7 +1051,17 @@ function ChatWidgetInner({
             disabled={isBusy}
           />
           {attachmentError ? (
-            <p className="text-xs text-destructive">{attachmentError}</p>
+            <p className="flex items-start gap-1.5 text-xs text-destructive">
+              <span className="min-w-0 flex-1">{attachmentError}</span>
+              <button
+                aria-label="Cerrar aviso"
+                className="shrink-0 rounded-full p-0.5 text-destructive/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
+                onClick={clearAttachmentError}
+                type="button"
+              >
+                <XIcon className="size-3" />
+              </button>
+            </p>
           ) : null}
 
           <div
@@ -527,11 +1091,20 @@ function ChatWidgetInner({
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={handleInputKeyDown}
+              onPaste={handleInputPaste}
               placeholder="Escribe tu pregunta…"
               rows={1}
               maxLength={1000}
-              className="field-sizing-content max-h-32 min-h-9 min-w-0 flex-1 resize-none border-0 bg-transparent px-1 py-1.5 font-mono text-[13px] outline-none placeholder:text-[var(--widget-text-faint)]"
-              style={{ color: "var(--widget-text-muted)" }}
+              className="field-sizing-content max-h-32 min-h-9 min-w-0 flex-1 resize-none border-0 bg-transparent px-1 py-1.5 font-mono text-[13px] outline-none transition-[height] duration-150 ease-out placeholder:text-[var(--widget-text-muted)]"
+              // El color del texto YA escrito se cambió de --widget-text-muted a
+              // --widget-text (normal, no gris) en un cambio anterior, pero el campo
+              // vacío solo muestra el placeholder — y ese seguía en --widget-text-faint
+              // (el gris MÁS claro de los tres, pensado para texto de placeholder "de
+              // catálogo"), que es justamente lo que se ve en el campo antes de escribir
+              // y lo que se seguía leyendo como "deshabilitado". Subido un escalón a
+              // --widget-text-muted (más oscuro, mismo tono que el ícono de historial de
+              // arriba) para que no se vea tan apagado incluso vacío.
+              style={{ color: "var(--widget-text)" }}
               disabled={isBusy && cancellationState === "idle"}
             />
 
@@ -566,7 +1139,20 @@ function ChatWidgetInner({
             )}
           </div>
         </form>
+        ) : null}
       </div>
+
+      <AnimatePresence>
+        {toast && !open ? (
+          <AgentReplyToast
+            key={toast.id}
+            onDismiss={() => setToast(null)}
+            onOpen={() => setOpen(true)}
+            preview={toast.preview}
+            sender="Jelou"
+          />
+        ) : null}
+      </AnimatePresence>
 
       <Button
         type="button"
@@ -580,6 +1166,89 @@ function ChatWidgetInner({
         {open ? <XIcon /> : <MessageCircleIcon />}
       </Button>
     </div>
+  );
+}
+
+/**
+ * Aviso "el agente respondió" que aparece junto al botón flotante cuando el panel está
+ * minimizado (ver el efecto que arma `toast` en ChatWidgetInner). Estructura calcada de
+ * la notificación de Intercom que pasó Esteban como referencia — avatar cuadrado a la
+ * izquierda, mensaje + "remitente • Ahora" a la derecha, botón de cerrar en la esquina —
+ * en vez de la burbuja con colita de las versiones anteriores. Superficie neutral
+ * (blanca + borde suave, igual que el panel del chat), sin acento a pantalla completa.
+ * Clickear el cuerpo abre el chat; si no la tocan, se cierra sola a los 8s (ver el
+ * setTimeout en ChatWidgetInner).
+ */
+function AgentReplyToast({
+  preview,
+  sender,
+  onOpen,
+  onDismiss,
+}: {
+  readonly preview: string;
+  readonly sender: string;
+  readonly onOpen: () => void;
+  readonly onDismiss: () => void;
+}) {
+  return (
+    <motion.div
+      animate={{ opacity: 1, scale: 1, y: 0 }}
+      aria-label={`Notificación de mensaje de ${sender}: ${preview}`}
+      aria-roledescription="message notification"
+      // Alto fijo (no `auto`) a propósito: esta tarjeta vive en un flujo flex-col junto al
+      // botón flotante (ver el contenedor más arriba), así que si su alto dependiera del
+      // contenido, un preview de 1 línea vs. uno de 2 líneas corría/empujaba el resto —
+      // se sentía como que la notificación "cambiaba de tamaño" cada vez que aparecía.
+      // Con un alto fijo + overflow-hidden, siempre ocupa exactamente el mismo espacio,
+      // sin importar cuánto texto tenga el preview (line-clamp-2 se sigue encargando de
+      // cortarlo si no entra).
+      className="pointer-events-auto relative h-[84px] w-[300px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl p-3 pr-7 shadow-lg"
+      exit={{ opacity: 0, scale: 0.95, y: 6 }}
+      initial={{ opacity: 0, scale: 0.95, y: 6 }}
+      role="article"
+      style={{
+        ...JELOU_VARS,
+        backgroundColor: "var(--widget-paper)",
+        border: "1px solid var(--widget-border)",
+      }}
+      tabIndex={0}
+      transition={{ duration: 0.18, ease: "easeOut" }}
+    >
+      <button
+        aria-label={`Abrir conversación con ${sender}`}
+        className="flex h-full w-full items-start gap-2.5 text-left"
+        onClick={onOpen}
+        type="button"
+      >
+        {/* size-12 (48px) en vez de size-10 (40px): mismo agrandado del isotipo que
+            en el resto del widget. */}
+        <span className="flex size-12 shrink-0 items-center justify-center">
+          <JelouIsotype size={38} />
+        </span>
+        <span className="min-w-0 flex-1">
+          {/* h-8 (2 líneas de text-xs) reserva el mismo espacio tenga el preview 1 o 2
+              líneas — si solo fuera line-clamp-2, un preview corto dejaba la tarjeta más
+              baja y la línea de abajo ("Jelou • Ahora") se movía hacia arriba. */}
+          <span
+            className="line-clamp-2 block h-8 text-xs"
+            style={{ color: "var(--widget-text)" }}
+          >
+            {preview}
+          </span>
+          <span className="mt-1 block text-[11px]" style={{ color: "var(--widget-text-faint)" }}>
+            {sender} • Ahora
+          </span>
+        </span>
+      </button>
+      <button
+        aria-label="Descartar aviso"
+        className="absolute top-2 right-2 flex size-5 items-center justify-center rounded-full text-[var(--widget-text-muted)] transition-colors hover:bg-[var(--widget-border-soft)]"
+        onClick={onDismiss}
+        type="button"
+      >
+        <XIcon className="size-3" />
+      </button>
+    </motion.div>
   );
 }
 

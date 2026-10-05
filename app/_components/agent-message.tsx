@@ -40,6 +40,8 @@ import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Button } from "@/components/ui/button";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import { Message, MessageContent, MessageFooter } from "@/components/ui/message";
+import { RESUME_CONTEXT_MARKER_PREFIX } from "@/lib/conversation-history";
+import { eveBackendUrl } from "@/lib/eve-backend-url";
 import { cn } from "@/lib/utils";
 
 export type AgentInputResponse = {
@@ -200,14 +202,43 @@ const markdownTableComponents = {
   ),
 };
 
+/**
+ * Marcador de texto que chat-widget.tsx agrega junto a cada imagen adjunta (ver
+ * handleSubmit) — no es algo que el usuario haya escrito, es una pista para que el
+ * modelo pueda citar la URL real si decide escalar el caso (ver agent/tools/escalar.ts,
+ * campo `imagenes`, en widget_back_end). Se manda tal cual al backend/modelo, pero en la
+ * UI no tiene sentido mostrarle al usuario el link crudo que él nunca escribió — acá se
+ * cuenta y se saca del texto visible, para reemplazarlo por un aviso corto sin el link.
+ */
+const IMAGE_ATTACHMENT_MARKER = /^\[Imagen adjunta: .+\]$/;
+
 export function AgentMessage({
   canRespond,
+  eveSessionId,
+  isLatestMessage,
   isNew,
   isStreaming,
   message,
   onInputResponses,
 }: {
   readonly canRespond: boolean;
+  /**
+   * `session.state.sessionId` del Client de eve (ver chat-widget.tsx) — no confundir
+   * con el `sessionId` de ChatWidgetProps (el de Jelou apps). Va al backend cuando se
+   * manda feedback de un mensaje (ver MessageActionsRow / POST /feedback en
+   * agent/channels/widget-http.ts).
+   */
+  readonly eveSessionId: string;
+  /**
+   * true si este es el último mensaje visible de la conversación. Determina si un tool
+   * call "pendiente" (analizador en_progreso, o una pregunta de ask_question sin
+   * responder — ver isAlwaysVisibleToolPart en ToolCallHistory) se sigue mostrando como
+   * en curso: apenas existe un mensaje posterior, ya sabemos que se resolvió (el
+   * analizador o el equipo de un escalamiento respondieron con un turno nuevo, ver
+   * use-analizador-poll.ts y POST /escalations/respond), aunque ese tool part en
+   * particular nunca se actualice in place.
+   */
+  readonly isLatestMessage: boolean;
   /**
    * true si el mensaje se agregó durante esta sesión (no venía ya en el historial
    * cargado al montar). Determina si el texto se revela progresivo o se muestra
@@ -233,7 +264,24 @@ export function AgentMessage({
   const otherParts = message.parts.filter(
     (part) => part.type !== "text" && part.type !== "dynamic-tool",
   );
-  const combinedText = textParts.map((part) => part.text).join("");
+  const imageMarkerCount = textParts.filter((part) =>
+    IMAGE_ATTACHMENT_MARKER.test(part.text.trim()),
+  ).length;
+  // Igual que IMAGE_ATTACHMENT_MARKER: chat-widget.tsx antepone este bloque (oculto)
+  // al primer mensaje nuevo después de "retomar" una conversación pasada (ver
+  // pendingResumeContextRef en handleSubmit) — el agente lo necesita, el usuario nunca
+  // lo escribió, así que no se muestra en la burbuja (ver hasResumeContext más abajo).
+  const hasResumeContext = textParts.some((part) =>
+    part.text.startsWith(RESUME_CONTEXT_MARKER_PREFIX),
+  );
+  const combinedText = textParts
+    .filter(
+      (part) =>
+        !IMAGE_ATTACHMENT_MARKER.test(part.text.trim()) &&
+        !part.text.startsWith(RESUME_CONTEXT_MARKER_PREFIX),
+    )
+    .map((part) => part.text)
+    .join("");
   // Solo relevante para la respuesta del asistente (la burbuja del usuario se muestra
   // entera, sin pausas) — se llama siempre igual, sin condicionales, por las reglas de
   // hooks; para el usuario simplemente no se usa su resultado.
@@ -248,19 +296,30 @@ export function AgentMessage({
       align={align}
       data-optimistic={message.metadata?.optimistic ? "true" : undefined}
     >
-      <MessageContent>
-        <ToolCallHistory
-          canRespond={canRespond}
-          isStreaming={isStreaming}
-          onInputResponses={onInputResponses}
-          parts={toolParts}
-        />
-
-        {combinedText ? (
+      {/* gap-1 en vez del gap-2.5 default de MessageContent: ese espacio queda igual
+          de grande aunque el MessageFooter de abajo (copiar/feedback) esté invisible
+          por el hover (opacity-0 reserva su alto igual, ver MessageActionsRow más
+          abajo) — con el default se sentía como un salto grande entre la burbuja del
+          usuario y la respuesta del agente que viene después. */}
+      <MessageContent className="gap-1">
+        {combinedText || imageMarkerCount > 0 || hasResumeContext ? (
           isUser ? (
             <Bubble align={align} variant="default">
               <BubbleContent className="whitespace-pre-wrap">
                 {combinedText}
+                {imageMarkerCount > 0 ? (
+                  <span
+                    className={
+                      combinedText
+                        ? "mt-1 block text-xs opacity-80"
+                        : "text-xs opacity-80"
+                    }
+                  >
+                    {imageMarkerCount === 1
+                      ? "Imagen agregada"
+                      : `${imageMarkerCount} imágenes agregadas`}
+                  </span>
+                ) : null}
               </BubbleContent>
             </Bubble>
           ) : (
@@ -287,6 +346,17 @@ export function AgentMessage({
           )
         ) : null}
 
+        {/* Tareas/tools abajo del mensaje, no arriba — la respuesta del agente es lo
+            primero que se lee, el detalle de qué hizo para llegar ahí queda como
+            contexto secundario debajo (ver conversación de diseño). */}
+        <ToolCallHistory
+          canRespond={canRespond}
+          isLatestMessage={isLatestMessage}
+          isStreaming={isStreaming}
+          onInputResponses={onInputResponses}
+          parts={toolParts}
+        />
+
         {otherParts.map((part, index) => (
           <AgentMessagePart key={partKey(part, index)} part={part} />
         ))}
@@ -294,10 +364,19 @@ export function AgentMessage({
         {/* Sin etiqueta de rol ("Tú"/"Jelou"/"Escribiendo…") — la posición del mensaje
             (izquierda/derecha) y el estilo ya distinguen quién habla, sin necesidad de
             repetirlo en texto. El footer ahora solo existe para las acciones
-            (copiar/feedback), y solo una vez que el mensaje terminó de generarse. */}
-        {!isRevealingResponse && !isStreaming && combinedText ? (
+            (copiar/feedback), y solo una vez que el mensaje terminó de generarse.
+            Solo para el asistente: en la burbuja del usuario el botón de copiar no
+            aportaba nada (es su propio texto, recién escrito) y quedaba flotando solo,
+            sin feedback al lado (showFeedback ya lo ocultaba solo para el usuario). */}
+        {!isUser && !isRevealingResponse && !isStreaming && combinedText ? (
           <MessageFooter className="gap-2">
-            <MessageActionsRow showFeedback={!isUser} text={combinedText} />
+            <MessageActionsRow
+              eveSessionId={eveSessionId}
+              messageId={message.id}
+              showFeedback={!isUser}
+              text={combinedText}
+              turnId={message.metadata?.turnId}
+            />
           </MessageFooter>
         ) : null}
       </MessageContent>
@@ -308,16 +387,26 @@ export function AgentMessage({
 /**
  * Fila de acciones del mensaje (copiar, y para el asistente, feedback de
  * buena/mala respuesta). Solo visible al hacer hover del mensaje o con foco
- * de teclado — usa el `group/message` que ya expone <Message>. El feedback
- * es un toggle puramente local por ahora: no hay endpoint que lo reciba, así
- * que no se persiste ni se envía a ningún lado todavía.
+ * de teclado — usa el `group/message` que ya expone <Message>.
+ *
+ * El feedback se manda a POST /feedback (ver agent/channels/widget-http.ts en el
+ * backend, tabla `message_feedback` en ClickHouse) apenas se marca up/down — no al
+ * togglear de vuelta a null, eso solo limpia el estado visual local. Fire-and-forget:
+ * si falla (red, backend caído, ClickHouse sin configurar) el botón sigue funcionando
+ * igual, solo no queda registrado — nunca bloquea ni le muestra un error al usuario.
  */
 function MessageActionsRow({
+  eveSessionId,
+  messageId,
   showFeedback,
   text,
+  turnId,
 }: {
+  readonly eveSessionId: string;
+  readonly messageId: string;
   readonly showFeedback: boolean;
   readonly text: string;
+  readonly turnId?: string;
 }) {
   const [copied, setCopied] = useState(false);
   const [feedback, setFeedback] = useState<"down" | "up" | null>(null);
@@ -341,8 +430,31 @@ function MessageActionsRow({
       });
   };
 
+  const sendFeedback = (rating: "down" | "up") => {
+    if (!eveSessionId) return;
+    fetch(eveBackendUrl("/feedback"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: eveSessionId, messageId, turnId, rating }),
+    }).catch(() => {
+      // Best-effort — ver comentario de MessageActionsRow más arriba.
+    });
+  };
+
+  // Antes esto animaba height (h-0 -> h-6) además de opacity para no reservar el alto
+  // completo del botón mientras está invisible — pero animar el height empuja/corre el
+  // mensaje siguiente en cada hover/unhover (el salto que se reportó). Ahora el alto
+  // reservado queda FIJO en h-3 (la mitad del size-6 real de los botones) — bastante
+  // menos que antes, así que el salto entre mensajes sigue chico — y solo se anima la
+  // opacity. Sin overflow-hidden, los botones (más altos que el contenedor) sobresalen
+  // centrados verticalmente al mostrarse en vez de forzar el contenedor a crecer, así
+  // que nada alrededor se mueve al hacer hover/unhover.
+  // Ya no lleva ml-auto: ahora MessageActionsRow solo se renderiza para la respuesta
+  // del asistente (ver AgentMessage más arriba, la burbuja del usuario ya no tiene
+  // footer), y el pedido fue que esa fila quede pegada a la izquierda, debajo del
+  // texto, en vez de empujada al borde derecho del footer.
   return (
-    <span className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/message:opacity-100">
+    <span className="flex h-3 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover/message:opacity-100">
       <Button
         aria-label="Copiar"
         onClick={handleCopy}
@@ -359,7 +471,11 @@ function MessageActionsRow({
             aria-pressed={feedback === "up"}
             className={feedback === "up" ? "text-success" : undefined}
             onClick={() =>
-              setFeedback((current) => (current === "up" ? null : "up"))
+              setFeedback((current) => {
+                if (current === "up") return null;
+                sendFeedback("up");
+                return "up";
+              })
             }
             size="icon-xs"
             type="button"
@@ -372,7 +488,11 @@ function MessageActionsRow({
             aria-pressed={feedback === "down"}
             className={feedback === "down" ? "text-destructive" : undefined}
             onClick={() =>
-              setFeedback((current) => (current === "down" ? null : "down"))
+              setFeedback((current) => {
+                if (current === "down") return null;
+                sendFeedback("down");
+                return "down";
+              })
             }
             size="icon-xs"
             type="button"
@@ -388,11 +508,25 @@ function MessageActionsRow({
 
 /**
  * Un tool call queda siempre visible, afuera del acordeón colapsable, cuando terminó
- * en error o tiene una pregunta sin responder todavía — son los únicos casos donde
- * esconderlo detrás de un "expandir" le tapa al usuario algo que necesita ver.
+ * en error, tiene una pregunta sin responder todavía, o es una investigación del
+ * analizador que sigue "en_progreso" (ver "Respuesta tardía del analizador" en
+ * agent/instructions.md) — son los únicos casos donde esconderlo detrás de un
+ * "expandir" le tapa al usuario algo que necesita ver.
  */
-function isAlwaysVisibleToolPart(part: EveDynamicToolPart): boolean {
+function isAlwaysVisibleToolPart(part: EveDynamicToolPart, isLatestMessage: boolean): boolean {
   if (part.state === "output-error") return true;
+  // "en_progreso" (analizador) y una pregunta sin `inputResponse` (ask_question,
+  // incluido el usado para el ida-y-vuelta de escalamiento a Slack) solo cuentan como
+  // pendientes de verdad en el ÚLTIMO mensaje visible: tanto la respuesta tardía del
+  // analizador (use-analizador-poll.ts) como la del equipo en Slack (POST
+  // /escalations/respond → agent/lib/eve-resume.ts) resuelven la sesión mandando un
+  // turno de texto plano nuevo en vez de completar este mismo tool part — así que en
+  // cuanto existe un mensaje posterior ya sabemos que se resolvió, aunque este part en
+  // particular haya quedado "congelado" con su estado viejo. Sin este chequeo,
+  // "Esperando respuesta..."/la pregunta sin responder se quedaban pegadas para siempre
+  // en el historial aunque el agente ya hubiera contestado.
+  if (!isLatestMessage) return false;
+  if (getAnalizadorOutputEstado(part) === "en_progreso") return true;
   const inputRequest = part.toolMetadata?.eve?.inputRequest;
   const inputResponse = part.toolMetadata?.eve?.inputResponse;
   return Boolean(inputRequest && !inputResponse);
@@ -415,11 +549,13 @@ function isAlwaysVisibleToolPart(part: EveDynamicToolPart): boolean {
  */
 function ToolCallHistory({
   canRespond,
+  isLatestMessage,
   isStreaming,
   onInputResponses,
   parts,
 }: {
   readonly canRespond: boolean;
+  readonly isLatestMessage: boolean;
   readonly isStreaming: boolean;
   readonly onInputResponses: (
     responses: readonly AgentInputResponse[],
@@ -432,8 +568,8 @@ function ToolCallHistory({
     return null;
   }
 
-  const always = parts.filter(isAlwaysVisibleToolPart);
-  const collapsible = parts.filter((part) => !isAlwaysVisibleToolPart(part));
+  const always = parts.filter((part) => isAlwaysVisibleToolPart(part, isLatestMessage));
+  const collapsible = parts.filter((part) => !isAlwaysVisibleToolPart(part, isLatestMessage));
   // Mientras isStreaming, ignora el `expanded` que el usuario haya elegido: si dejamos
   // que la lista completa crezca en vivo mientras el agente sigue llamando tools, cada
   // tool call nuevo cambia la altura del bloque y eso re-dispara el auto-scroll de
@@ -448,6 +584,7 @@ function ToolCallHistory({
       {always.map((part) => (
         <ToolPart
           canRespond={canRespond}
+          isLatestMessage={isLatestMessage}
           key={part.toolCallId}
           onInputResponses={onInputResponses}
           part={part}
@@ -462,7 +599,7 @@ function ToolCallHistory({
           type="button"
         >
           <ChevronRightIcon className="size-3.5 shrink-0" />
-          <span className="truncate">{getToolDisplayName(last)}</span>
+          <span className="truncate">{getToolDisplayName(last, isLatestMessage)}</span>
           {collapsible.length > 1 ? (
             <span className="shrink-0 text-muted-foreground/70">
               · +{collapsible.length - 1} más
@@ -484,6 +621,7 @@ function ToolCallHistory({
             {collapsible.map((part) => (
               <ToolPart
                 canRespond={canRespond}
+                isLatestMessage={isLatestMessage}
                 key={part.toolCallId}
                 onInputResponses={onInputResponses}
                 part={part}
@@ -603,7 +741,7 @@ function formatDuration(durationMs: number): string {
 }
 
 /**
- * Nombres legibles para las tools propias (ver agent/tools/*.ts) y para el `ask_question`
+ * Nombres legibles para las tools propias (ver widget_back_end/agent/tools/*.ts) y para el `ask_question`
  * built-in de eve. Cualquier tool nueva que no esté acá cae en `humanizeToolName` (snake/
  * kebab-case → "Palabra Palabra") en vez de mostrar la key técnica cruda.
  */
@@ -630,41 +768,49 @@ function humanizeToolName(name: string): string {
 }
 
 /**
- * El analizador (agent/tools/analizador.ts) es una sola tool que corre subcomandos muy
- * distintos entre sí (`logs chat`, `whoami`, `project list`, etc.) — en vez de mostrar
- * siempre la misma etiqueta genérica, el label varía según el tipo de operación real:
- * - Comandos que pueden recorrer varios eventos/pasos (`logs`, `test`) → "Ejecutando
- *   proceso" (puede tardar).
- * - Diagnóstico/identidad, perfil más técnico (`whoami`, `doctor`, `status`, `link`) →
- *   "Ejecutando comando".
- * - El resto (consultas simples: `project`, `channels`, `metrics`, etc.) → "Procesando
- *   solicitud" (el label más amigable, default para el usuario final).
- * Nunca usamos "Aplicando cambios" acá: el analizador es de solo lectura por diseño, así
- * que esa etiqueta no le corresponde a ninguna de sus operaciones.
+ * El analizador (widget_back_end/agent/tools/analizador.ts) delega en jelou-ops-support-chat, así que el
+ * tool call en sí siempre termina rápido ("output-available") aunque la investigación de
+ * fondo siga sin resolverse — el propio output trae `estado: "en_progreso"` en ese caso
+ * (ver agent/instructions.md, "Respuesta tardía del analizador"). Sin esto, la UI
+ * mostraría "listo" mientras en realidad la respuesta real todavía puede tardar minutos.
  */
-const ANALIZADOR_MULTISTEP_COMMANDS = new Set(["logs", "test"]);
-const ANALIZADOR_TECHNICAL_COMMANDS = new Set(["whoami", "doctor", "status", "link"]);
-
-function getAnalizadorDisplayName(part: EveDynamicToolPart): string {
-  const input = part.input;
-  const args =
-    typeof input === "object" &&
-    input !== null &&
-    "args" in input &&
-    Array.isArray((input as { args?: unknown }).args)
-      ? (input as { args: unknown[] }).args.filter(
-          (arg): arg is string => typeof arg === "string",
-        )
-      : [];
-  const command = args[0];
-
-  if (command !== undefined && ANALIZADOR_MULTISTEP_COMMANDS.has(command)) {
-    return "Ejecutando proceso";
+function getAnalizadorOutputEstado(part: EveDynamicToolPart): string | undefined {
+  if (part.state !== "output-available") return undefined;
+  const output = part.output;
+  if (typeof output !== "object" || output === null || !("estado" in output)) {
+    return undefined;
   }
-  if (command !== undefined && ANALIZADOR_TECHNICAL_COMMANDS.has(command)) {
-    return "Ejecutando comando";
+  const estado = (output as { estado: unknown }).estado;
+  return typeof estado === "string" ? estado : undefined;
+}
+
+/**
+ * Ticket (formato WI####, ver widget_back_end/agent/lib/ticket.ts) de la investigación
+ * del analizador en curso — lo único que el output trae todavía mientras `estado` es
+ * "en_progreso" (ver agent/tools/analizador.ts, outputSchema). Usado para el detalle que
+ * se despliega al expandir esa fila (ver ToolPart, `analizadorPending`/`showDetail` más
+ * abajo) — antes esa fila no tenía nada para expandir mientras seguía en curso.
+ */
+function getAnalizadorTicket(part: EveDynamicToolPart): string | undefined {
+  if (part.state !== "output-available") return undefined;
+  const output = part.output;
+  if (typeof output !== "object" || output === null || !("ticket" in output)) {
+    return undefined;
   }
-  return "Procesando solicitud";
+  const ticket = (output as { ticket: unknown }).ticket;
+  return typeof ticket === "string" ? ticket : undefined;
+}
+
+function getAnalizadorDisplayName(part: EveDynamicToolPart, isLatestMessage: boolean): string {
+  // "Investigando" (gerundio) se sentía contradictorio combinado con el sufijo " ·
+  // listo" que agrega ToolPart más abajo una vez resuelto (ver analizadorPending ahí) —
+  // parecía que el estado nunca se actualizaba ("Investigando · listo" lee como si
+  // siguiera en curso). "Investigación" es un sustantivo neutro, igual que el resto de
+  // las etiquetas de este archivo ("Cargando guía...", "Delegando a..."), así que
+  // combinado con ese sufijo queda "Investigación · listo" sin la contradicción.
+  return isLatestMessage && getAnalizadorOutputEstado(part) === "en_progreso"
+    ? "Esperando respuesta de la investigación"
+    : "Investigación";
 }
 
 /**
@@ -672,7 +818,7 @@ function getAnalizadorDisplayName(part: EveDynamicToolPart): string {
  * skill cargado, subagente); si no hay mapeo explícito, humaniza la key en vez de
  * mostrarla cruda — nunca se ve un "search_jelou_docs" o "escalar-brain" tal cual.
  */
-function getToolDisplayName(part: EveDynamicToolPart): string {
+export function getToolDisplayName(part: EveDynamicToolPart, isLatestMessage: boolean): string {
   const eveMeta = part.toolMetadata?.eve;
   const name = eveMeta?.name ?? part.toolName;
 
@@ -683,44 +829,141 @@ function getToolDisplayName(part: EveDynamicToolPart): string {
     return `Delegando a ${humanizeToolName(name)}`;
   }
   if (name === "analizador") {
-    return getAnalizadorDisplayName(part);
+    return getAnalizadorDisplayName(part, isLatestMessage);
   }
   return TOOL_DISPLAY_NAMES[name] ?? humanizeToolName(name);
 }
 
+/**
+ * True si un dynamic-tool part sigue "en curso" ahora mismo — incluye el caso especial
+ * del analizador, que devuelve `output-available` en cuanto jelou-ops-support-chat
+ * confirma recibido el mensaje, aunque la investigación real (estado "en_progreso" en el
+ * output) pueda seguir corriendo minutos más (ver getAnalizadorOutputEstado arriba).
+ * Compartido entre ToolPart (para el shimmer de cada fila) y getActiveToolLabel (para el
+ * indicador "el agente está trabajando" de ChatWidget/AgentChat).
+ */
+export function isToolPartRunning(part: EveDynamicToolPart, isLatestMessage: boolean): boolean {
+  if (!isLatestMessage) return false;
+  return (
+    part.state === "input-streaming" ||
+    part.state === "input-available" ||
+    part.state === "approval-requested" ||
+    getAnalizadorOutputEstado(part) === "en_progreso"
+  );
+}
+
+/**
+ * Nombre legible de la tool que está corriendo AHORA MISMO en el último mensaje del
+ * historial, si hay alguna — usado por el indicador "el agente está trabajando" (ver
+ * components/use-active-tool-label.ts) para que ese texto refleje lo que el agente
+ * realmente está haciendo (buscando docs, investigando con el analizador, escalando a
+ * Slack…) en vez de un texto fijo siempre igual. `undefined` cuando el último mensaje no
+ * tiene ningún dynamic-tool part en curso — por ejemplo, el modelo todavía no decidió
+ * llamar ninguna tool en este turno, o va a responder directo sin tools — el llamador
+ * debe mostrar un texto neutro de respaldo en ese caso.
+ */
+export function getActiveToolLabel(messages: readonly EveMessage[]): string | undefined {
+  const lastMessage = messages[messages.length - 1];
+  if (!lastMessage) return undefined;
+
+  const toolParts = lastMessage.parts.filter(
+    (part): part is EveDynamicToolPart => part.type === "dynamic-tool",
+  );
+  for (let i = toolParts.length - 1; i >= 0; i--) {
+    // getActiveToolLabel siempre mira el último mensaje real (ver arriba), así que acá
+    // isLatestMessage es true por construcción.
+    if (isToolPartRunning(toolParts[i], true)) return getToolDisplayName(toolParts[i], true);
+  }
+  return undefined;
+}
+
 function ToolPart({
   canRespond,
+  isLatestMessage,
   onInputResponses,
   part,
 }: {
   readonly canRespond: boolean;
+  readonly isLatestMessage: boolean;
   readonly onInputResponses: (
     responses: readonly AgentInputResponse[],
   ) => void | Promise<void>;
   readonly part: EveDynamicToolPart;
 }) {
-  const running =
-    part.state === "input-streaming" ||
-    part.state === "input-available" ||
-    part.state === "approval-requested";
+  // El analizador puede terminar el tool call ("output-available") con la investigación
+  // real todavía sin resolver (estado "en_progreso" — ver getAnalizadorOutputEstado más
+  // abajo). En ese caso lo tratamos como si siguiera en curso: shimmer encendido y
+  // sufijo "en curso" en vez de "listo", aunque técnicamente el llamado ya respondió —
+  // pero solo mientras este sea el último mensaje (ver isAlwaysVisibleToolPart más
+  // arriba): una vez que el analizador o un escalamiento responden, la sesión sigue con
+  // un mensaje nuevo y este part queda mostrado como resuelto en vez de "en curso" para
+  // siempre.
+  const analizadorPending = isLatestMessage && getAnalizadorOutputEstado(part) === "en_progreso";
+  const running = isToolPartRunning(part, isLatestMessage);
   const durationMs = useToolCallDuration(part.state);
+  // Mientras la investigación del analizador sigue en curso, esta fila se queda SIEMPRE
+  // visible (ver isAlwaysVisibleToolPart más arriba) en vez de esconderse en el
+  // acordeón de ToolCallHistory — pero eso la dejaba sin ninguna forma de interactuar
+  // con ella (el usuario reportó justo esto: "el panel de investigación no es
+  // interactuable" mientras está buscando). El output todavía no trae nada de detalle
+  // real (ver agent/tools/analizador.ts) salvo el ticket, así que acá solo se agrega un
+  // toggle local para mostrarlo — no hace falta esperar a que termine para poder
+  // desplegar algo.
+  const [showDetail, setShowDetail] = useState(false);
+  const analizadorTicket = analizadorPending ? getAnalizadorTicket(part) : undefined;
 
-  return (
-    <div className="w-full max-w-[90%] space-y-2">
-      <Marker variant="default" role="status">
-        <MarkerIcon>
-          <FileIcon />
-        </MarkerIcon>
-        <MarkerContent className={running ? "shimmer" : undefined}>
-          {getToolDisplayName(part)}
-          {part.state === "output-available"
+  const markerContent = (
+    <>
+      <MarkerIcon>
+        <FileIcon />
+      </MarkerIcon>
+      <MarkerContent className={running ? "shimmer" : undefined}>
+        {getToolDisplayName(part, isLatestMessage)}
+        {analizadorPending
+          ? " · en curso"
+          : part.state === "output-available"
             ? " · listo"
             : part.state === "output-error"
               ? " · error"
               : " · en curso"}
-          {durationMs !== null ? ` · ${formatDuration(durationMs)}` : null}
-        </MarkerContent>
-      </Marker>
+        {durationMs !== null ? ` · ${formatDuration(durationMs)}` : null}
+      </MarkerContent>
+      {analizadorPending ? (
+        <ChevronRightIcon
+          className={cn(
+            "size-3.5 shrink-0 text-muted-foreground/70 transition-transform",
+            showDetail && "rotate-90",
+          )}
+        />
+      ) : null}
+    </>
+  );
+
+  return (
+    <div className="w-full max-w-[90%] space-y-2">
+      {analizadorPending ? (
+        <Marker asChild role="status" variant="default">
+          <button
+            aria-expanded={showDetail}
+            className="transition-colors hover:text-foreground"
+            onClick={() => setShowDetail((value) => !value)}
+            type="button"
+          >
+            {markerContent}
+          </button>
+        </Marker>
+      ) : (
+        <Marker role="status" variant="default">
+          {markerContent}
+        </Marker>
+      )}
+      {analizadorPending && showDetail ? (
+        <p className="pl-6 text-xs text-muted-foreground">
+          {analizadorTicket ? `Ticket ${analizadorTicket}. ` : ""}
+          Puede tardar hasta 10 minutos — te avisamos acá mismo apenas tengamos
+          respuesta.
+        </p>
+      ) : null}
       <InputRequestActions
         canRespond={canRespond}
         onInputResponses={onInputResponses}

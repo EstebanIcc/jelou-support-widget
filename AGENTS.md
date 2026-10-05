@@ -1,10 +1,16 @@
-# eve Agent App
+# jelou-eve-agent (frontend / widget)
 
-This project uses the eve framework. Before writing code, read the relevant guide
-from the installed eve package docs. In most installs, those docs are at
-`node_modules/eve/docs/`. In workspaces or local package installs, resolve the
-installed `eve` package location first and read its `docs/` directory. If
-package docs are unavailable, use https://eve.dev/docs as a fallback.
+Este proyecto es solo el FRONTEND del widget de chat (Next.js + shadcn). El agente
+(framework eve: instructions, tools, skills, canales, y los endpoints
+/analizador/status, /attachments/upload-image, /escalations/respond,
+/internal/user-context) vive aparte, en el proyecto hermano `widget_back_end`, y se
+consume acá por HTTP vía `NEXT_PUBLIC_EVE_BACKEND_URL` (ver components/chat-widget.tsx
+y lib/backend-user-context.ts).
+
+Este proyecto sigue dependiendo del paquete `eve` solo por su SDK de cliente
+(`eve/client`, `eve/react`) — no corre `eve dev`/`eve build` acá ni tiene carpeta
+`agent/`. Si necesitas tocar la lógica del agente en sí, hazlo en `widget_back_end`,
+no en este repo.
 
 <!-- BEGIN:nextjs-agent-rules -->
 # This is NOT the Next.js you know

@@ -9,6 +9,7 @@ import {
   PaperclipIcon,
   SendIcon,
   SquareIcon,
+  XIcon,
 } from "lucide-react";
 import {
   useCallback,
@@ -16,6 +17,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
   type FormEvent,
   type KeyboardEvent,
 } from "react";
@@ -35,10 +37,14 @@ import {
   useEveChatWatcher,
   writePersistedChat,
 } from "@/components/use-eve-chat-sync";
+import { isAnalizadorReplyMessage } from "@/lib/analizador-reply";
 import { isEscalationReplyMessage } from "@/lib/escalation";
+import { useAnalizadorPoll } from "@/components/use-analizador-poll";
+import { useActiveToolLabel } from "@/components/use-active-tool-label";
 import { Marker, MarkerContent } from "@/components/ui/marker";
 import { Message, MessageContent } from "@/components/ui/message";
 import { cn } from "@/lib/utils";
+import { AnimatePresence, motion } from "motion/react";
 
 const AGENT_NAME = "Asistente Jelou";
 const STORAGE_KEY = "jelou-eve-agent:full-chat";
@@ -61,17 +67,32 @@ type Cancellation = {
  */
 export function AgentChat() {
   const { generation, reportIdle } = useEveChatWatcher(STORAGE_KEY);
-  return <AgentChatInner key={generation} reportIdle={reportIdle} />;
+  return (
+    <AgentChatInner
+      key={generation}
+      // Mismo fix que components/chat-widget.tsx: solo el primer montaje real anima el
+      // scroll inicial. Un remount con generation > 0 (respuesta externa detectada por el
+      // watcher) usa "instant" para no mostrar la conversación saltando arriba y volviendo
+      // a bajar sola.
+      initialScroll={generation === 0 ? "smooth" : "instant"}
+      reportIdle={reportIdle}
+    />
+  );
 }
 
 function AgentChatInner({
+  initialScroll,
   reportIdle,
 }: {
+  readonly initialScroll: "instant" | "smooth";
   readonly reportIdle: (idle: boolean) => void;
 }) {
   const [saved] = useState(() => readPersistedChat(STORAGE_KEY));
   const [session] = useState(() =>
-    new Client({ host: "", preserveCompletedSessions: true }).session(
+    new Client({
+      host: process.env.NEXT_PUBLIC_EVE_BACKEND_URL ?? "",
+      preserveCompletedSessions: true,
+    }).session(
       saved.session,
     ),
   );
@@ -86,6 +107,7 @@ function AgentChatInner({
     addFiles,
     removeAttachment,
     clearAttachments,
+    clearError: clearAttachmentError,
     error: attachmentError,
     isRecording,
     toggleRecording,
@@ -139,12 +161,23 @@ function AgentChatInner({
     },
     session,
   });
+  // Mientras haya una investigación del analizador "en_progreso", pregunta en segundo
+  // plano si ya hay respuesta y la inyecta sola apenas llegue (ver
+  // components/use-analizador-poll.ts y "Respuesta tardía del analizador" en
+  // agent/instructions.md).
+  useAnalizadorPoll(agent, session);
+  // Texto del indicador "trabajando" de abajo — refleja la tool activa en vez de un
+  // texto fijo (ver components/use-active-tool-label.ts).
+  const activeToolLabel = useActiveToolLabel(agent.data.messages);
+
   const isBusy = agent.status === "submitted" || agent.status === "streaming";
-  // El turno "user" que /api/escalations/respond inyecta al reanudar un escalamiento
-  // no lo escribió el usuario — se oculta para que solo se vea la respuesta que el
-  // agente genera a partir de él (ver lib/escalation.ts).
+  // El turno "user" que el backend (widget_back_end): /escalations/respond (o el polling del analizador, ver
+  // arriba) inyecta al reanudar la conversación no lo escribió el usuario — se oculta
+  // para que solo se vea la respuesta que el agente genera a partir de él (ver
+  // lib/escalation.ts y lib/analizador-reply.ts).
   const visibleMessages = agent.data.messages.filter(
-    (message) => !isEscalationReplyMessage(message),
+    (message) =>
+      !isEscalationReplyMessage(message) && !isAnalizadorReplyMessage(message),
   );
   const isEmpty = visibleMessages.length === 0;
   // Ids de mensajes que ya existían al montar (vienen de localStorage/historial) — se
@@ -214,6 +247,13 @@ function AgentChatInner({
         mediaType: file.mediaType,
         type: "file",
       });
+      // Además de la imagen en sí (para que el modelo la "vea"), le mandamos su URL
+      // pública como texto plano citable — el modelo no puede transcribir el contenido
+      // de una imagen que ve, pero sí puede repetir esta URL si decide escalar el caso
+      // (ver widget_back_end/agent/tools/escalar.ts, campo `imagenes`, y use-chat-attachments.ts).
+      if (file.mediaUrl) {
+        parts.push({ text: `[Imagen adjunta: ${file.mediaUrl}]`, type: "text" });
+      }
     }
     await agent.send({ message: parts });
   };
@@ -224,6 +264,21 @@ function AgentChatInner({
     }
     event.preventDefault();
     event.currentTarget.form?.requestSubmit();
+  };
+
+  // Pegar una imagen (Ctrl+V/Cmd+V con algo copiado, p.ej. un screenshot) la adjunta
+  // igual que si se hubiera elegido desde el explorador de archivos — mismo pipeline
+  // (Data URL + subida al backend (widget_back_end): /attachments/upload-image, ver use-chat-attachments.ts). Si
+  // el portapapeles no trae ningún archivo de imagen (paste de texto normal), no se
+  // intercepta nada — el pegado de texto sigue funcionando como siempre.
+  const handleInputPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageFiles = Array.from(event.clipboardData?.items ?? [])
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (imageFiles.length === 0) return;
+    event.preventDefault();
+    void addFiles(imageFiles);
   };
 
   const handleFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -272,7 +327,7 @@ function AgentChatInner({
               shadcn-ui/ui#11224, donde autoScroll se desenganchaba solo). Sin anclaje de
               "pregunta nueva arriba" — use-stick-to-bottom solo sigue el final, que es
               justamente lo que queríamos. */}
-          <Conversation className="h-full min-h-0 flex-1">
+          <Conversation className="h-full min-h-0 flex-1" initial={initialScroll}>
             <ConversationContent className="gap-4 px-1 py-2">
               {isEmpty ? (
                 <Message align="start">
@@ -291,10 +346,24 @@ function AgentChatInner({
                 <AgentMessage
                   key={message.id}
                   canRespond={!isBusy}
+                  eveSessionId={session.state.sessionId ?? ""}
+                  isLatestMessage={index === visibleMessages.length - 1}
                   isNew={!initialMessageIdsRef.current?.has(message.id)}
+                  // Comparado contra agent.data.messages (sin filtrar) en vez de
+                  // contra visibleMessages/index: si se compara por índice, mientras el
+                  // analizador resuelve en segundo plano (ver use-analizador-poll.ts),
+                  // el mensaje "reply" oculto que agent.send() agrega queda afuera de
+                  // visibleMessages, así que el ÚLTIMO mensaje VISIBLE sigue siendo el
+                  // mensaje anterior (el que ya había terminado, con su botón de copiar
+                  // ya mostrado) hasta que la respuesta nueva arranca a streamear — eso
+                  // lo marcaba como isStreaming de nuevo y le hacía desaparecer el botón
+                  // de copiar sin que el usuario hiciera nada. Comparando por id contra
+                  // el mensaje crudo más reciente, ese mensaje ya resuelto nunca vuelve a
+                  // marcarse como streaming solo porque hay un turno oculto en curso.
                   isStreaming={
                     agent.status === "streaming" &&
-                    index === visibleMessages.length - 1
+                    message.id ===
+                      agent.data.messages[agent.data.messages.length - 1]?.id
                   }
                   message={message}
                   onInputResponses={(inputResponses) => {
@@ -308,8 +377,22 @@ function AgentChatInner({
                 <Message align="start">
                   <MessageContent>
                     <Marker role="status">
-                      <MarkerContent className="shimmer">
-                        Consultando docs Jelou…
+                      <MarkerContent>
+                        {/* mode="wait": evita que el label viejo y el nuevo coexistan en
+                            el DOM durante el crossfade (ver el mismo comentario en
+                            chat-widget.tsx), lo que ensancharía la línea un instante. */}
+                        <AnimatePresence initial={false} mode="wait">
+                          <motion.span
+                            key={activeToolLabel}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="shimmer inline-block"
+                            exit={{ opacity: 0, y: -4 }}
+                            initial={{ opacity: 0, y: 4 }}
+                            transition={{ duration: 0.18, ease: "easeOut" }}
+                          >
+                            {activeToolLabel}
+                          </motion.span>
+                        </AnimatePresence>
                       </MarkerContent>
                     </Marker>
                   </MessageContent>
@@ -330,7 +413,17 @@ function AgentChatInner({
             disabled={isBusy}
           />
           {attachmentError ? (
-            <p className="text-xs text-destructive">{attachmentError}</p>
+            <p className="flex items-start gap-1.5 text-xs text-destructive">
+              <span className="min-w-0 flex-1">{attachmentError}</span>
+              <button
+                aria-label="Cerrar aviso"
+                className="shrink-0 rounded-full p-0.5 text-destructive/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
+                onClick={clearAttachmentError}
+                type="button"
+              >
+                <XIcon className="size-3" />
+              </button>
+            </p>
           ) : null}
           <div className="flex items-end gap-2">
             <input
@@ -365,6 +458,7 @@ function AgentChatInner({
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={handleInputKeyDown}
+              onPaste={handleInputPaste}
               placeholder="Pregunta sobre Jelou AI… (Shift+Enter para salto de línea)"
               rows={1}
               className="field-sizing-content max-h-40 min-h-10 min-w-0 flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"

@@ -108,7 +108,7 @@ export function clearPersistedChat(storageKey: string) {
  * ella misma inició (ver eve/docs/guides/frontend/overview.mdx): en cuanto la
  * sesión llega a `session.waiting`, la conexión se cierra. Eso significa que
  * si algo externo reanuda esa sesión — por ejemplo, la respuesta de un equipo
- * a un escalamiento entregada vía `/api/escalations/respond` — el navegador
+ * a un escalamiento entregada vía `el backend (widget_back_end): /escalations/respond` — el navegador
  * nunca se entera, aunque la pestaña siga abierta.
  *
  * Este hook cubre ambos huecos:
@@ -159,7 +159,7 @@ export function useEveChatWatcher(storageKey: string) {
         let burstWait: ReturnType<typeof setTimeout> | undefined;
 
         try {
-          const client = new Client({ host: "" });
+          const client = new Client({ host: process.env.NEXT_PUBLIC_EVE_BACKEND_URL ?? "" });
           const peek = client.session({ sessionId: current.session.sessionId, streamIndex: 0 });
           for await (const event of peek.stream({ startIndex: knownIndex, signal: controller.signal })) {
             // Si mientras juntábamos eventos la propia pestaña volvió a estar activa

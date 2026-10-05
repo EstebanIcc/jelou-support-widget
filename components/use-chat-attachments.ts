@@ -2,11 +2,23 @@
 
 import { useCallback, useRef, useState } from "react";
 
+import { eveBackendUrl } from "@/lib/eve-backend-url";
+
 export type ChatAttachment = {
   id: string;
   url: string;
   filename: string;
   mediaType: string;
+  /**
+   * URL pública permanente (CDN), solo presente cuando `mediaType` es una imagen y la
+   * subida al backend (widget_back_end): /attachments/upload-image funcionó. `url` (Data URL) sigue siendo lo que
+   * se manda al modelo para que "vea" la imagen — `mediaUrl` es lo que se manda además
+   * como texto citable, para que el modelo pueda repetirlo si decide escalar el caso (ver
+   * handleSubmit en chat-widget.tsx/agent-chat.tsx y el campo `imagenes` de
+   * widget_back_end/agent/tools/escalar.ts). Si falta, el adjunto igual funciona para verlo en el chat,
+   * solo que no se puede referenciar por URL en un escalamiento.
+   */
+  mediaUrl?: string;
 };
 
 function readFileAsDataUrl(file: File): Promise<string> {
@@ -17,6 +29,30 @@ function readFileAsDataUrl(file: File): Promise<string> {
       reject(reader.error ?? new Error("No se pudo leer el archivo"));
     reader.readAsDataURL(file);
   });
+}
+
+/**
+ * Sube una imagen (Data URL) al backend (widget_back_end): /attachments/upload-image para conseguirle una URL
+ * pública permanente. Nunca lanza: si falla (red, servicio caído, respuesta inesperada),
+ * devuelve `undefined` y el adjunto sigue funcionando igual para verlo en el chat, solo
+ * que sin URL citable para un escalamiento — no bloquea poder mandar el mensaje.
+ */
+async function uploadImageForPermanentUrl(dataUrl: string): Promise<string | undefined> {
+  try {
+    const response = await fetch(
+      eveBackendUrl("/attachments/upload-image"),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base64: dataUrl }),
+      },
+    );
+    if (!response.ok) return undefined;
+    const json = (await response.json()) as { ok?: boolean; mediaUrl?: string };
+    return json.ok ? json.mediaUrl : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function nextId(): string {
@@ -51,12 +87,20 @@ export function useChatAttachments() {
     setError(undefined);
     try {
       const added = await Promise.all(
-        list.map(async (file) => ({
-          filename: file.name,
-          id: nextId(),
-          mediaType: file.type || "application/octet-stream",
-          url: await readFileAsDataUrl(file),
-        })),
+        list.map(async (file) => {
+          const mediaType = file.type || "application/octet-stream";
+          const url = await readFileAsDataUrl(file);
+          const mediaUrl = mediaType.startsWith("image/")
+            ? await uploadImageForPermanentUrl(url)
+            : undefined;
+          return {
+            filename: file.name,
+            id: nextId(),
+            mediaType,
+            mediaUrl,
+            url,
+          };
+        }),
       );
       setAttachments((prev) => [...prev, ...added]);
     } catch {
@@ -66,6 +110,13 @@ export function useChatAttachments() {
 
   const removeAttachment = useCallback((id: string) => {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
+  }, []);
+
+  // Permite descartar el aviso de error (adjunto fallido, micrófono sin permiso, etc.)
+  // a mano, sin esperar a que el próximo intento lo vuelva a pisar solo — ver el botón
+  // de cerrar junto al mensaje en chat-widget.tsx/agent-chat.tsx.
+  const clearError = useCallback(() => {
+    setError(undefined);
   }, []);
 
   const clearAttachments = useCallback(() => {
@@ -141,6 +192,7 @@ export function useChatAttachments() {
     addFiles,
     attachments,
     clearAttachments,
+    clearError,
     error,
     isRecording,
     removeAttachment,
