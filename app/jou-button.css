@@ -1,0 +1,358 @@
+/* Generado desde buttons.scss (jelou-ui-2) compilado con Tailwind v3 + su tailwind.config.ts.
+   Corrección aplicada: theme("colors.gray-outline-2") -> colors.gray.outline-2 */
+:root {
+  /* Variables que consume jou-button.css (valores tomados de la paleta del tailwind.config del kit). */
+  --jou-border-radius: 12px; /* botón = calc(radio - 4px) = 8px; SUPUESTO, confirmar con la app principal */
+  --jou-duration: 150ms;
+  --jou-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --jou-primary-color: 0 179 199; /* primary-500 #00B3C7 */
+  --jou-on-primary-text-color: 255 255 255;
+  --jou-semantic-error-50: 254 238 238;
+  --jou-semantic-error-100: 249 90 89;
+  --jou-semantic-error-200: 220 38 38;
+  --jou-semantic-warning-100: 253 202 23;
+  --jou-semantic-warning-200: 243 175 64;
+  --jou-surface-background-color: 255 255 255;
+  --jou-on-surface-text-color: 48 59 86;
+  --jou-neutral-background-color-50: 247 248 250;
+  --jou-border-color: 220 222 228;
+  --jou-help-text-color: 114 124 148;
+}
+
+.jou-btn {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 20px;
+  height: 32px;
+  padding: 6px 12px;
+  font-style: normal;
+  font-weight: 700;
+  border: 0;
+  border-radius: calc(var(--jou-border-radius) - 4px);
+  text-shadow: none;
+  transition: all var(--jou-duration) var(--jou-ease);
+  background-color: rgb(var(--jou-primary-color));
+  color: rgb(var(--jou-on-primary-text-color));
+}
+.jou-btn:hover {
+  --tw-bg-opacity: 1;
+  background-color: rgb(0 158 175 / var(--tw-bg-opacity, 1));
+}
+.jou-btn:active {
+  --tw-bg-opacity: 1;
+  background-color: rgb(0 117 130 / var(--tw-bg-opacity, 1));
+}
+.jou-btn[data-variant=default][data-state=open] {
+  --tw-bg-opacity: 1;
+  background-color: rgb(0 117 130 / var(--tw-bg-opacity, 1));
+}
+.jou-btn[data-variant=default][data-state=open]:hover {
+  --tw-bg-opacity: 1;
+  background-color: rgb(0 117 130 / var(--tw-bg-opacity, 1));
+}
+.jou-btn:disabled, .jou-btn[aria-disabled=true] {
+  cursor: not-allowed;
+  opacity: 0.5;
+  background-color: rgb(var(--jou-primary-color));
+}
+.jou-btn:focus-visible {
+  box-shadow: 0 0 0 2px white, 0 0 0 4px rgb(var(--jou-primary-color)/0.5);
+}
+.jou-btn svg {
+  pointer-events: none;
+  flex-shrink: 0;
+}
+.jou-btn svg:not([class*=size-]):not([width]):not([height]) {
+  width: 1rem;
+  height: 1rem;
+}
+
+.jou-btn--destructive {
+  background-color: rgb(var(--jou-semantic-error-100));
+  color: white;
+}
+.jou-btn--destructive:hover {
+  background-color: rgb(var(--jou-semantic-error-200));
+}
+.jou-btn--destructive:active {
+  background-color: rgb(var(--jou-semantic-error-200));
+}
+.jou-btn--destructive:focus-visible {
+  box-shadow: 0 0 0 2px white, 0 0 0 4px rgb(var(--jou-semantic-error-100)/0.5);
+}
+.jou-btn--destructive:disabled, .jou-btn--destructive[aria-disabled=true] {
+  cursor: not-allowed;
+  opacity: 0.5;
+  background-color: rgb(var(--jou-semantic-error-100));
+  color: white;
+}
+
+.jou-btn--destructive-outline {
+  background-color: white;
+  color: rgb(var(--jou-semantic-error-100));
+  border: 1px solid rgb(var(--jou-semantic-error-100));
+}
+.jou-btn--destructive-outline:hover {
+  background-color: rgb(var(--jou-semantic-error-50));
+}
+.jou-btn--destructive-outline:active {
+  background-color: rgb(var(--jou-semantic-error-50));
+}
+.jou-btn--destructive-outline:disabled, .jou-btn--destructive-outline[aria-disabled=true] {
+  background-color: white;
+  --tw-border-opacity: 1;
+  border-color: rgb(220 222 228 / var(--tw-border-opacity, 1));
+  --tw-text-opacity: 1;
+  color: rgb(220 222 228 / var(--tw-text-opacity, 1));
+}
+
+.jou-btn--outline {
+  background-color: white;
+  color: rgb(var(--jou-primary-color));
+  border: 1px solid rgb(var(--jou-primary-color));
+}
+.jou-btn--outline:hover {
+  --tw-bg-opacity: 1;
+  background-color: rgb(230 247 249 / var(--tw-bg-opacity, 1));
+}
+.jou-btn--outline:active {
+  --tw-bg-opacity: 1;
+  background-color: rgb(230 247 249 / var(--tw-bg-opacity, 1));
+}
+.jou-btn--outline[data-state=open] {
+  --tw-bg-opacity: 1;
+  background-color: rgb(230 247 249 / var(--tw-bg-opacity, 1));
+}
+.jou-btn--outline[data-state=open]:hover {
+  --tw-bg-opacity: 1;
+  background-color: rgb(230 247 249 / var(--tw-bg-opacity, 1));
+}
+.jou-btn--outline:disabled, .jou-btn--outline[aria-disabled=true] {
+  background-color: white;
+  --tw-border-opacity: 1;
+  border-color: rgb(220 222 228 / var(--tw-border-opacity, 1));
+  --tw-text-opacity: 1;
+  color: rgb(220 222 228 / var(--tw-text-opacity, 1));
+}
+
+.jou-btn--ghost {
+  padding-left: 1rem;
+  padding-right: 1rem;
+  background-color: transparent;
+  color: rgb(var(--jou-primary-color));
+}
+.jou-btn--ghost:hover {
+  --tw-bg-opacity: 1;
+  background-color: rgb(230 247 249 / var(--tw-bg-opacity, 1));
+}
+.jou-btn--ghost:active {
+  --tw-bg-opacity: 1;
+  background-color: rgb(230 247 249 / var(--tw-bg-opacity, 1));
+}
+.jou-btn--ghost:disabled, .jou-btn--ghost[aria-disabled=true] {
+  background-color: transparent;
+  --tw-text-opacity: 1;
+  color: rgb(220 222 228 / var(--tw-text-opacity, 1));
+}
+
+.jou-btn--link {
+  background-color: transparent;
+  color: rgb(var(--jou-primary-color));
+  text-underline-offset: 4px;
+}
+.jou-btn--link:hover {
+  background-color: transparent;
+  text-decoration: underline;
+}
+.jou-btn--link:active {
+  background-color: transparent;
+  text-decoration: underline;
+}
+.jou-btn--link:disabled, .jou-btn--link[aria-disabled=true] {
+  background-color: transparent;
+  --tw-text-opacity: 1;
+  color: rgb(220 222 228 / var(--tw-text-opacity, 1));
+}
+
+.jou-btn--warning {
+  background-color: rgb(var(--jou-semantic-warning-200));
+  color: white;
+}
+.jou-btn--warning:hover {
+  background-color: rgb(var(--jou-semantic-warning-100));
+  color: #2B3041;
+}
+.jou-btn--warning:active {
+  background-color: rgb(var(--jou-semantic-warning-100));
+  color: #2B3041;
+}
+.jou-btn--warning:disabled, .jou-btn--warning[aria-disabled=true] {
+  --tw-bg-opacity: 1;
+  background-color: rgb(241 243 245 / var(--tw-bg-opacity, 1));
+  --tw-text-opacity: 1;
+  color: rgb(220 222 228 / var(--tw-text-opacity, 1));
+}
+
+.jou-btn--secondary {
+  --tw-bg-opacity: 1;
+  background-color: rgb(241 243 245 / var(--tw-bg-opacity, 1));
+  --tw-text-opacity: 1;
+  color: rgb(60 66 84 / var(--tw-text-opacity, 1));
+}
+.jou-btn--secondary:hover {
+  --tw-bg-opacity: 1;
+  background-color: rgb(220 222 228 / var(--tw-bg-opacity, 1));
+}
+.jou-btn--secondary:active {
+  --tw-bg-opacity: 1;
+  background-color: rgb(220 222 228 / var(--tw-bg-opacity, 1));
+}
+.jou-btn--secondary:disabled, .jou-btn--secondary[aria-disabled=true] {
+  --tw-bg-opacity: 1;
+  background-color: rgb(241 243 245 / var(--tw-bg-opacity, 1));
+  --tw-text-opacity: 1;
+  color: rgb(220 222 228 / var(--tw-text-opacity, 1));
+}
+
+.jou-btn--white {
+  background-color: rgb(var(--jou-surface-background-color));
+  color: rgb(var(--jou-on-surface-text-color));
+  border: 1px solid #E3E5EC;
+  border-radius: 8px;
+}
+.jou-btn--white:hover {
+  background-color: rgb(var(--jou-neutral-background-color-50));
+}
+.jou-btn--white:active {
+  background-color: rgb(var(--jou-neutral-background-color-50));
+}
+.jou-btn--white:disabled, .jou-btn--white[aria-disabled=true] {
+  pointer-events: none;
+  border-color: transparent;
+  --tw-bg-opacity: 1;
+  background-color: rgb(241 243 245 / var(--tw-bg-opacity, 1));
+  --tw-text-opacity: 1;
+  color: rgb(220 222 228 / var(--tw-text-opacity, 1));
+}
+
+.jou-btn--sm {
+  height: 24px;
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 14px;
+}
+
+.jou-btn--lg {
+  gap: 0.5rem;
+  height: 36px;
+  padding: 8px 12px;
+}
+.jou-btn--lg svg:not([class*=size-]) {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.jou-btn--icon {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 9999px;
+}
+
+.jou-btn--ghost:has(> svg:only-child) {
+  --tw-text-opacity: 1;
+  color: rgb(114 124 148 / var(--tw-text-opacity, 1));
+}
+.jou-btn--ghost:has(> svg:only-child)[data-state=open] {
+  color: rgb(var(--jou-primary-color));
+  --tw-bg-opacity: 1;
+  background-color: rgb(230 247 249 / var(--tw-bg-opacity, 1));
+}
+
+.jou-btn--ghost.jou-btn--icon:hover:not(:disabled):not([aria-disabled=true]),
+.jou-btn--ghost.jou-btn--icon-sm:hover:not(:disabled):not([aria-disabled=true]),
+.jou-btn--ghost.jou-btn--icon-xs:hover:not(:disabled):not([aria-disabled=true]),
+.jou-btn--ghost.jou-btn--icon-lg:hover:not(:disabled):not([aria-disabled=true]) {
+  background-color: #EFF1F4;
+}
+.jou-btn--ghost.jou-btn--icon:active:not(:disabled):not([aria-disabled=true]),
+.jou-btn--ghost.jou-btn--icon-sm:active:not(:disabled):not([aria-disabled=true]),
+.jou-btn--ghost.jou-btn--icon-xs:active:not(:disabled):not([aria-disabled=true]),
+.jou-btn--ghost.jou-btn--icon-lg:active:not(:disabled):not([aria-disabled=true]) {
+  background-color: #EFF1F4;
+}
+
+.jou-btn--icon-sm {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 9999px;
+}
+
+.jou-btn--icon-xs {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 9999px;
+}
+
+.jou-btn--icon-lg {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 9999px;
+}
+.jou-btn--icon-lg svg:not([class*=size-]) {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.jou-btn--white.jou-btn--icon,
+.jou-btn--white.jou-btn--icon-sm,
+.jou-btn--white.jou-btn--icon-xs,
+.jou-btn--white.jou-btn--icon-lg {
+  border-radius: 8px;
+}
+
+.jou-btn.jou-chip-quiet,
+.jou-btn.jou-chip-warning {
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  padding: 4px 12px;
+  gap: 6px;
+  font-weight: 500;
+}
+
+.jou-btn.jou-chip-quiet {
+  border-color: rgb(var(--jou-border-color));
+  color: rgb(var(--jou-help-text-color));
+}
+.jou-btn.jou-chip-quiet:hover {
+  background-color: #EFF1F4;
+  color: rgb(var(--jou-on-surface-text-color));
+}
+.jou-btn.jou-chip-quiet:active {
+  background-color: #EFF1F4;
+  color: rgb(var(--jou-on-surface-text-color));
+}
+
+.jou-btn.jou-chip-warning {
+  border-color: #FDCA17;
+  background-color: #FFFAE8;
+  color: #F3AF40;
+}
+.jou-btn.jou-chip-warning:hover {
+  background-color: #FDCA17;
+  color: #2B3041;
+}
+.jou-btn.jou-chip-warning:active {
+  background-color: #FDCA17;
+  color: #2B3041;
+}

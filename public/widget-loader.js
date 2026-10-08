@@ -19,6 +19,9 @@
   var sessionId = currentScript.getAttribute("data-session-id") || "";
   var position = currentScript.getAttribute("data-position") === "left" ? "left" : "right";
   var offset = currentScript.getAttribute("data-offset") || "0px";
+  // data-open="true": el panel arranca abierto apenas carga el widget, sin que el
+  // usuario toque el botón (equivale a llamar window.JelouWidget.open() al cargar).
+  var autoOpen = currentScript.getAttribute("data-open") === "true";
 
   // Log en la consola del navegador del sitio que integra el widget: confirma
   // exactamente qué leyó el loader de los atributos data-* del <script>, antes de
@@ -72,6 +75,30 @@
     height: "min(180px, calc(100vh - " + offset + "))",
   };
 
+  // API pública para la página que embebe el widget:
+  //   window.JelouWidget.open()   — abre el panel
+  //   window.JelouWidget.close()  — lo cierra
+  //   window.JelouWidget.toggle() — alterna
+  // Se puede llamar en cualquier momento, incluso antes de que el iframe termine de
+  // cargar: los comandos quedan en cola y se envían cuando el widget avisa que está listo.
+  var iframeWindow = null;
+  var widgetReady = false;
+  var pendingCommands = autoOpen ? ["open"] : [];
+
+  function sendCommand(type) {
+    if (widgetReady && iframeWindow) {
+      iframeWindow.postMessage({ source: "jelou-widget-host", type: type }, origin);
+    } else {
+      pendingCommands.push(type);
+    }
+  }
+
+  window.JelouWidget = {
+    open: function () { sendCommand("open"); },
+    close: function () { sendCommand("close"); },
+    toggle: function () { sendCommand("toggle"); },
+  };
+
   function buildWidgetUrl() {
     var url = new URL("/widget", origin);
     if (title) url.searchParams.set("title", title);
@@ -101,14 +128,26 @@
     iframe.style.border = "none";
     iframe.style.background = "transparent";
     iframe.setAttribute("allowtransparency", "true");
+    // Permisos delegados al iframe (cross-origin, por defecto bloqueados): portapapeles
+    // para el botón "Copiar" de las respuestas, y micrófono para grabar audio.
+    iframe.setAttribute("allow", "clipboard-write; microphone");
 
     container.appendChild(iframe);
     document.body.appendChild(container);
+    iframeWindow = iframe.contentWindow;
 
     window.addEventListener("message", function (event) {
       if (event.source !== iframe.contentWindow) return;
       var data = event.data;
-      if (!data || data.source !== "jelou-widget" || data.type !== "resize") return;
+      if (!data || data.source !== "jelou-widget") return;
+      if (data.type === "ready") {
+        widgetReady = true;
+        var queued = pendingCommands;
+        pendingCommands = [];
+        queued.forEach(sendCommand);
+        return;
+      }
+      if (data.type !== "resize") return;
       var size = data.open ? OPEN_SIZE : data.peek ? PEEK_SIZE : CLOSED_SIZE;
       container.style.width = size.width;
       container.style.height = size.height;
