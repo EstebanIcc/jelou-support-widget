@@ -39,10 +39,14 @@ import {
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Button as JouButton } from "@/components/jelou/button";
 import { Button } from "@/components/ui/button";
 import { ChatAttachmentList } from "@/components/chat-attachment-list";
 import { ConversationList } from "@/components/conversation-list";
-import { useChatAttachments } from "@/components/use-chat-attachments";
+import {
+  ATTACHMENT_ACCEPT,
+  useChatAttachments,
+} from "@/components/use-chat-attachments";
 import {
   clearPersistedChat,
   readPersistedChat,
@@ -234,6 +238,29 @@ export function ChatWidget({
     );
   }, [open, peek]);
 
+  // Control desde la página que embebe el widget (ver window.JelouWidget en
+  // public/widget-loader.js): abrir/cerrar el panel sin que el usuario toque el botón
+  // flotante. El loader manda { source: "jelou-widget-host", type: "open" | "close" |
+  // "toggle" } al iframe; solo se aceptan mensajes que vengan de la ventana padre
+  // (event.source) — no se puede validar el origen porque cualquier sitio puede embeber
+  // el widget, pero lo peor que un mensaje así puede hacer es abrir/cerrar el panel.
+  // Al terminar de montar avisa { type: "ready" } para que el loader suelte lo que haya
+  // quedado pendiente (p.ej. un open() llamado antes de que el iframe cargara).
+  useEffect(() => {
+    if (typeof window === "undefined" || window.self === window.top) return;
+    const handleMessage = (event: MessageEvent) => {
+      if (event.source !== window.parent) return;
+      const data = event.data as { source?: unknown; type?: unknown } | null;
+      if (!data || data.source !== "jelou-widget-host") return;
+      if (data.type === "open") setOpen(true);
+      else if (data.type === "close") setOpen(false);
+      else if (data.type === "toggle") setOpen((prev) => !prev);
+    };
+    window.addEventListener("message", handleMessage);
+    window.parent.postMessage({ source: "jelou-widget", type: "ready" }, "*");
+    return () => window.removeEventListener("message", handleMessage);
+  }, []);
+
   return (
     <ChatWidgetInner
       key={generation}
@@ -337,21 +364,51 @@ function ChatWidgetInner({
   // cuando él mismo decide seguir escribiendo (ver handleSubmit).
   const pendingResumeContextRef = useRef<string | undefined>(undefined);
 
-  const loadConversations = useCallback(async () => {
-    if (!email) return;
-    setConversationsStatus("loading");
-    try {
-      const items = await fetchRecentConversations(email);
-      setConversations(items);
-      setConversationsStatus("ready");
-    } catch (error) {
-      console.error(
-        "[jelou-widget] no se pudieron cargar las conversaciones anteriores:",
-        error,
-      );
-      setConversationsStatus("error");
-    }
+  // La lista viene de ClickHouse (vía el backend) y la primera consulta después de un
+  // rato sin uso puede tardar bastante (servicio ocioso despertando / función en frío).
+  // Dos cosas para que el usuario no lo sufra:
+  //  - se pide apenas se ABRE el panel (ver el efecto de abajo), no recién al tocar el
+  //    botón de historial, así que cuando llega a la lista ya suele estar cargada;
+  //  - "stale-while-revalidate": si ya hay una lista cargada, volver a pedirla no vuelve
+  //    a mostrar el spinner ni la borra si falla — se sigue viendo la anterior mientras
+  //    se refresca por detrás. El spinner/error solo aparece mientras no hubo ninguna
+  //    carga exitosa todavía.
+  // Pedidos simultáneos (el prefetch todavía en vuelo + el click) comparten la misma
+  // promesa en vez de lanzar dos consultas.
+  const conversationsLoadedRef = useRef(false);
+  const conversationsInFlightRef = useRef<Promise<void> | null>(null);
+
+  const loadConversations = useCallback((): Promise<void> => {
+    if (!email) return Promise.resolve();
+    if (conversationsInFlightRef.current) return conversationsInFlightRef.current;
+    if (!conversationsLoadedRef.current) setConversationsStatus("loading");
+    const request = (async () => {
+      try {
+        const items = await fetchRecentConversations(email);
+        conversationsLoadedRef.current = true;
+        setConversations(items);
+        setConversationsStatus("ready");
+      } catch (error) {
+        console.error(
+          "[jelou-widget] no se pudieron cargar las conversaciones anteriores:",
+          error,
+        );
+        if (!conversationsLoadedRef.current) setConversationsStatus("error");
+      } finally {
+        conversationsInFlightRef.current = null;
+      }
+    })();
+    conversationsInFlightRef.current = request;
+    return request;
   }, [email]);
+
+  // Prefetch silencioso: una sola vez, la primera vez que el panel se abre con `email`.
+  const conversationsPrefetchedRef = useRef(false);
+  useEffect(() => {
+    if (!open || !email || conversationsPrefetchedRef.current) return;
+    conversationsPrefetchedRef.current = true;
+    void loadConversations();
+  }, [open, email, loadConversations]);
 
   const openConversationList = () => {
     setView("list");
@@ -539,6 +596,17 @@ function ChatWidgetInner({
     lastVisibleMessage.parts.some(
       (part) => part.type === "text" || part.type === "dynamic-tool",
     );
+  // eve (EveAgentStore.send) primero marca status "submitted" y recién DESPUÉS —tras un
+  // `await` de prepareSend— agrega el mensaje optimista del usuario. En ese primer
+  // render (isBusy ya true, tu mensaje todavía no) "Pensando…" se pintaba antes que la
+  // burbuja (y en el primer mensaje, junto al saludo); al llegar la burbuja, "Pensando…"
+  // bajaba de golpe. Solo se muestra una vez que hay un mensaje visible (la burbuja ya
+  // está) y el último no tiene contenido todavía.
+  const showWorkingIndicator =
+    isBusy &&
+    cancellationState === "idle" &&
+    visibleMessages.length > 0 &&
+    !lastMessageHasVisibleContent;
   // Nunca se muestra agent.error?.message / cancellationError tal cual — ver
   // toFriendlyErrorMessage arriba. El crudo solo va a consola, para debug.
   useEffect(() => {
@@ -860,26 +928,16 @@ function ChatWidgetInner({
             className="shrink-0 p-3"
             style={{ borderTop: "1px solid var(--widget-border-soft)" }}
           >
-            {/* Mismo patrón que el botón "Hacer una pregunta" de Intercom (texto +
-                ícono a la derecha) pero con el isotipo de Jelou en vez de su flecha.
-                Fondo blanco y ancho ajustado al contenido (ya no w-full ni accent de
-                fondo) — con fondo blanco el isotipo (su propio cyan fijo, #00B3C7, ver
-                jelou-isotype.tsx) ya tiene contraste de sobra solo, sin necesitar el
-                chip blanco de antes; el borde es lo que lo separa del panel, que
-                también es blanco (--widget-paper). */}
-            <button
-              className="mx-auto flex items-center justify-center gap-2 rounded-full px-4 py-1.5 text-xs font-medium transition-opacity hover:opacity-90"
-              onClick={handleStartNewConversation}
-              style={{
-                backgroundColor: "#FFFFFF",
-                border: "1px solid var(--widget-border)",
-                color: "var(--widget-accent)",
-              }}
-              type="button"
-            >
-              Hacer una pregunta
-              <JelouIsotype size={20} />
-            </button>
+            {/* Botón del kit @jelou-ui-2 (variant "outline": fondo blanco, borde y texto
+                en el primary #00B3C7) con el isotipo de Jelou a la derecha, como el
+                "Hacer una pregunta" de Intercom. Si se quiere el borde gris suave de
+                antes, cambiar a variant="white". */}
+            <div className="flex justify-center">
+              <JouButton onClick={handleStartNewConversation} variant="outline">
+                Hacer una pregunta
+                <JelouIsotype size={20} />
+              </JouButton>
+            </div>
           </div>
         ) : null}
 
@@ -999,7 +1057,12 @@ function ChatWidgetInner({
                 />
               ))}
 
-              {isBusy && cancellationState === "idle" && !lastMessageHasVisibleContent ? (
+              {/* Hueco fijo para el indicador "trabajando": reserva su alto (min-h-5 = el
+                  de una fila de Marker) también en reposo, así que cuando aparece/desaparece
+                  "Pensando…" no cambia la altura del contenido y Conversation
+                  (use-stick-to-bottom) no vuelve a deslizar el scroll ~28px por eso. */}
+              <div className="min-h-5">
+              {showWorkingIndicator ? (
                 // Sin avatar, igual que el saludo de arriba: este bloque es el que se
                 // reemplaza en el momento exacto en que llega contenido real (ver
                 // lastMessageHasVisibleContent), y AgentMessage nunca pinta un avatar —
@@ -1033,6 +1096,7 @@ function ChatWidgetInner({
                   </MessageContent>
                 </Message>
               ) : null}
+              </div>
             </ConversationContent>
             <ConversationScrollButton />
           </Conversation>
@@ -1071,6 +1135,7 @@ function ChatWidgetInner({
             <input
               ref={fileInputRef}
               type="file"
+              accept={ATTACHMENT_ACCEPT}
               multiple
               className="hidden"
               onChange={handleFileInputChange}

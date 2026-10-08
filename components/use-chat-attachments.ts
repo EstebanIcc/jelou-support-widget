@@ -21,6 +21,21 @@ export type ChatAttachment = {
   mediaUrl?: string;
 };
 
+/**
+ * Único tipo de archivo que se puede compartir en el chat: imágenes, videos y audios.
+ * `ATTACHMENT_ACCEPT` es el filtro del selector de archivos del navegador (solo una
+ * ayuda visual — se puede saltar —, por eso addFiles vuelve a validar con
+ * isAllowedAttachment: pegar, arrastrar o elegir "Todos los archivos" también pasan por ahí).
+ */
+export const ATTACHMENT_ACCEPT = "image/*,video/*,audio/*";
+
+const ALLOWED_ATTACHMENT_PREFIXES = ["image/", "video/", "audio/"] as const;
+
+function isAllowedAttachment(file: File): boolean {
+  const type = file.type.toLowerCase();
+  return ALLOWED_ATTACHMENT_PREFIXES.some((prefix) => type.startsWith(prefix));
+}
+
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -81,10 +96,15 @@ export function useChatAttachments() {
   const streamRef = useRef<MediaStream | null>(null);
 
   const addFiles = useCallback(async (files: FileList | File[]) => {
-    const list = Array.from(files);
-    if (list.length === 0) return;
+    const requested = Array.from(files);
+    if (requested.length === 0) return;
 
     setError(undefined);
+    const list = requested.filter(isAllowedAttachment);
+    if (list.length < requested.length) {
+      setError("Solo puedes compartir imágenes, videos y audios.");
+    }
+    if (list.length === 0) return;
     try {
       const added = await Promise.all(
         list.map(async (file) => {

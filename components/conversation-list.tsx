@@ -82,7 +82,7 @@ export function ConversationList({
     return (
       <div className="flex flex-1 items-center justify-center p-6 text-center">
         <p className="text-xs" style={{ color: "var(--widget-text-muted)" }}>
-          No tenés conversaciones anteriores.
+          No tienes conversaciones anteriores.
         </p>
       </div>
     );

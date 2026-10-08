@@ -29,9 +29,12 @@ import {
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Button } from "@/components/ui/button";
+import { Button } from "@/components/jelou/button";
 import { ChatAttachmentList } from "@/components/chat-attachment-list";
-import { useChatAttachments } from "@/components/use-chat-attachments";
+import {
+  ATTACHMENT_ACCEPT,
+  useChatAttachments,
+} from "@/components/use-chat-attachments";
 import {
   readPersistedChat,
   useEveChatWatcher,
@@ -180,6 +183,20 @@ function AgentChatInner({
       !isEscalationReplyMessage(message) && !isAnalizadorReplyMessage(message),
   );
   const isEmpty = visibleMessages.length === 0;
+  // Mismo criterio que chat-widget.tsx (ver showWorkingIndicator ahí): eve marca "ocupado"
+  // un render ANTES de agregar el mensaje optimista del usuario, así que sin este chequeo
+  // "Pensando…" aparecía primero y la burbuja nueva lo empujaba hacia abajo al entrar.
+  const lastVisibleMessage = visibleMessages[visibleMessages.length - 1];
+  const lastMessageHasVisibleContent =
+    lastVisibleMessage?.role === "assistant" &&
+    lastVisibleMessage.parts.some(
+      (part) => part.type === "text" || part.type === "dynamic-tool",
+    );
+  const showWorkingIndicator =
+    isBusy &&
+    cancellationState === "idle" &&
+    visibleMessages.length > 0 &&
+    !lastMessageHasVisibleContent;
   // Ids de mensajes que ya existían al montar (vienen de localStorage/historial) — se
   // captura una sola vez, en el primer render. Sirve para decidir en AgentMessage si un
   // mensaje debe animarse letra por letra o mostrarse entero de una: usar `isStreaming`
@@ -373,7 +390,12 @@ function AgentChatInner({
                 />
               ))}
 
-              {isBusy && cancellationState === "idle" ? (
+              {/* Hueco fijo para el indicador "trabajando": reserva su alto (min-h-5 = el
+                  de una fila de Marker) también en reposo, así que cuando aparece/desaparece
+                  "Pensando…" no cambia la altura del contenido y Conversation
+                  (use-stick-to-bottom) no vuelve a deslizar el scroll ~28px por eso. */}
+              <div className="min-h-5">
+              {showWorkingIndicator ? (
                 <Message align="start">
                   <MessageContent>
                     <Marker role="status">
@@ -398,6 +420,7 @@ function AgentChatInner({
                   </MessageContent>
                 </Message>
               ) : null}
+              </div>
             </ConversationContent>
             <ConversationScrollButton />
           </Conversation>
@@ -429,6 +452,7 @@ function AgentChatInner({
             <input
               ref={fileInputRef}
               type="file"
+              accept={ATTACHMENT_ACCEPT}
               multiple
               className="hidden"
               onChange={handleFileInputChange}
@@ -437,23 +461,23 @@ function AgentChatInner({
               type="button"
               size="icon"
               variant="ghost"
+              iconOnly
+              leftIcon={<PaperclipIcon />}
               aria-label="Adjuntar archivo"
               disabled={isBusy}
               onClick={() => fileInputRef.current?.click()}
-            >
-              <PaperclipIcon />
-            </Button>
+            />
             <Button
               type="button"
               size="icon"
               variant={isRecording ? "destructive" : "ghost"}
+              iconOnly
+              leftIcon={<MicIcon className={isRecording ? "animate-pulse" : undefined} />}
               aria-label={isRecording ? "Detener grabación" : "Grabar audio"}
               aria-pressed={isRecording}
               disabled={isBusy}
               onClick={toggleRecording}
-            >
-              <MicIcon className={isRecording ? "animate-pulse" : undefined} />
-            </Button>
+            />
             <textarea
               value={input}
               onChange={(event) => setInput(event.target.value)}
@@ -469,20 +493,20 @@ function AgentChatInner({
                 type="button"
                 size="icon"
                 variant="secondary"
+                iconOnly
+                leftIcon={<SquareIcon className="size-3.5 fill-current" />}
                 aria-label="Detener"
                 onClick={requestCancellation}
-              >
-                <SquareIcon className="size-3.5 fill-current" />
-              </Button>
+              />
             ) : (
               <Button
                 type="submit"
                 size="icon"
+                iconOnly
+                leftIcon={<SendIcon />}
                 aria-label="Enviar"
                 disabled={!input.trim() && attachments.length === 0}
-              >
-                <SendIcon />
-              </Button>
+              />
             )}
           </div>
         </form>

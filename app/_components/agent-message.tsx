@@ -23,7 +23,13 @@ import {
   ThumbsUpIcon,
   XCircleIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ComponentProps } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type MouseEvent,
+} from "react";
 
 import {
   Attachment,
@@ -210,7 +216,55 @@ const markdownTableComponents = {
  * UI no tiene sentido mostrarle al usuario el link crudo que él nunca escribió — acá se
  * cuenta y se saca del texto visible, para reemplazarlo por un aviso corto sin el link.
  */
-const IMAGE_ATTACHMENT_MARKER = /^\[Imagen adjunta: .+\]$/;
+const IMAGE_ATTACHMENT_MARKER = /^\[Imagen adjunta: (.+)\]$/;
+
+/**
+ * Mientras eve todavía no confirmó el mensaje del usuario, el cliente (EveAgentStore) lo
+ * pinta como un único texto "aplanado": cada adjunto pasa a ser una línea `[file: nombre]`
+ * y el marcador `[Imagen adjunta: URL]` queda pegado al texto con saltos de línea, en vez
+ * de venir como partes separadas. Por eso se filtra línea por línea (no por parte entera):
+ * ni el placeholder ni la URL cruda se muestran nunca, tampoco en ese instante.
+ */
+const FILE_PLACEHOLDER_LINE = /^\[file(?:: .*)?\]$/;
+
+function splitHiddenAttachmentLines(text: string): {
+  readonly imageUrls: string[];
+  readonly placeholderCount: number;
+  readonly text: string;
+} {
+  const imageUrls: string[] = [];
+  let placeholderCount = 0;
+  const kept: string[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    const marker = IMAGE_ATTACHMENT_MARKER.exec(trimmed);
+    if (marker) {
+      imageUrls.push(marker[1]);
+      continue;
+    }
+    if (FILE_PLACEHOLDER_LINE.test(trimmed)) {
+      placeholderCount += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { imageUrls, placeholderCount, text: kept.join("\n") };
+}
+
+/**
+ * Abre un adjunto en una pestaña nueva. Las URLs `data:` (el archivo tal cual lo mandó el
+ * navegador) no se pueden abrir directo con un link — Chrome bloquea la navegación de
+ * nivel superior a data: URLs y queda una pestaña en blanco —, así que se convierten a
+ * Blob y se abre su object URL. Las URLs http(s) (p.ej. el CDN de las imágenes) se abren
+ * normal, sin pasar por acá.
+ */
+async function openDataUrlInNewTab(dataUrl: string): Promise<void> {
+  const blob = await (await fetch(dataUrl)).blob();
+  const objectUrl = URL.createObjectURL(blob);
+  window.open(objectUrl, "_blank", "noopener,noreferrer");
+  // Margen para que la pestaña nueva alcance a cargarlo antes de liberarlo.
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+}
 
 export function AgentMessage({
   canRespond,
@@ -264,9 +318,20 @@ export function AgentMessage({
   const otherParts = message.parts.filter(
     (part) => part.type !== "text" && part.type !== "dynamic-tool",
   );
-  const imageMarkerCount = textParts.filter((part) =>
-    IMAGE_ATTACHMENT_MARKER.test(part.text.trim()),
-  ).length;
+  // Se parte cada texto en líneas para sacar (sin mostrarlos) los marcadores de adjuntos:
+  // ver FILE_PLACEHOLDER_LINE / splitHiddenAttachmentLines arriba.
+  const cleanedTexts = textParts
+    .filter((part) => !part.text.startsWith(RESUME_CONTEXT_MARKER_PREFIX))
+    .map((part) => splitHiddenAttachmentLines(part.text));
+  const imageUrls = cleanedTexts.flatMap((cleaned) => cleaned.imageUrls);
+  const placeholderCount = cleanedTexts.reduce(
+    (total, cleaned) => total + cleaned.placeholderCount,
+    0,
+  );
+  const imageMarkerCount = imageUrls.length;
+  // Adjuntos que aún no llegaron como "file" part (mensaje todavía sin confirmar) y no
+  // son imágenes con URL: igual se avisa que hay algo adjunto, sin nombre ni link.
+  const otherAttachmentCount = imageMarkerCount === 0 ? placeholderCount : 0;
   // Igual que IMAGE_ATTACHMENT_MARKER: chat-widget.tsx antepone este bloque (oculto)
   // al primer mensaje nuevo después de "retomar" una conversación pasada (ver
   // pendingResumeContextRef en handleSubmit) — el agente lo necesita, el usuario nunca
@@ -274,14 +339,8 @@ export function AgentMessage({
   const hasResumeContext = textParts.some((part) =>
     part.text.startsWith(RESUME_CONTEXT_MARKER_PREFIX),
   );
-  const combinedText = textParts
-    .filter(
-      (part) =>
-        !IMAGE_ATTACHMENT_MARKER.test(part.text.trim()) &&
-        !part.text.startsWith(RESUME_CONTEXT_MARKER_PREFIX),
-    )
-    .map((part) => part.text)
-    .join("");
+  const joinedText = cleanedTexts.map((cleaned) => cleaned.text).join("");
+  const combinedText = isUser ? joinedText.trim() : joinedText;
   // Solo relevante para la respuesta del asistente (la burbuja del usuario se muestra
   // entera, sin pausas) — se llama siempre igual, sin condicionales, por las reglas de
   // hooks; para el usuario simplemente no se usa su resultado.
@@ -290,6 +349,29 @@ export function AgentMessage({
     isNew,
   );
   const isRevealingResponse = !isUser && (isStreaming || isRevealing);
+
+  // eve crea el mensaje del asistente apenas empieza el turno, con solo partes que no
+  // pintan nada (p.ej. "step-start"). Renderizado igual, <Message>/<MessageContent> vacíos
+  // son una fila de alto 0 dentro de ConversationContent (flex con gap-2): esa fila fantasma
+  // agregaba 8px de gap POR ENCIMA del indicador "Pensando…" justo cuando llegaba el
+  // mensaje, y el indicador bajaba 8px de golpe. Sin contenido visible no se monta nada.
+  const hasRenderableContent =
+    isUser ||
+    combinedText.length > 0 ||
+    imageMarkerCount > 0 ||
+    otherAttachmentCount > 0 ||
+    hasResumeContext ||
+    toolParts.length > 0 ||
+    otherParts.some(
+      (part) =>
+        part.type === "reasoning" ||
+        part.type === "file" ||
+        part.type === "authorization",
+    );
+
+  if (!hasRenderableContent) {
+    return null;
+  }
 
   return (
     <Message
@@ -302,12 +384,15 @@ export function AgentMessage({
           abajo) — con el default se sentía como un salto grande entre la burbuja del
           usuario y la respuesta del agente que viene después. */}
       <MessageContent className="gap-1">
-        {combinedText || imageMarkerCount > 0 || hasResumeContext ? (
+        {combinedText ||
+        imageMarkerCount > 0 ||
+        otherAttachmentCount > 0 ||
+        hasResumeContext ? (
           isUser ? (
             <Bubble align={align} variant="default">
               <BubbleContent className="whitespace-pre-wrap">
                 {combinedText}
-                {imageMarkerCount > 0 ? (
+                {imageMarkerCount > 0 || otherAttachmentCount > 0 ? (
                   <span
                     className={
                       combinedText
@@ -315,9 +400,13 @@ export function AgentMessage({
                         : "text-xs opacity-80"
                     }
                   >
-                    {imageMarkerCount === 1
-                      ? "Imagen agregada"
-                      : `${imageMarkerCount} imágenes agregadas`}
+                    {imageMarkerCount > 0
+                      ? imageMarkerCount === 1
+                        ? "Imagen agregada"
+                        : `${imageMarkerCount} imágenes agregadas`
+                      : otherAttachmentCount === 1
+                        ? "Archivo adjunto"
+                        : `${otherAttachmentCount} archivos adjuntos`}
                   </span>
                 ) : null}
               </BubbleContent>
@@ -339,9 +428,12 @@ export function AgentMessage({
               >
                 {visibleText}
               </MessageResponse>
-              {isRevealingResponse ? (
-                <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-current align-middle" />
-              ) : null}
+              {/* Sin cursor parpadeante al final del texto: era un bloque sólido de 4x12px
+                  que, mientras el mensaje seguía "en streaming" (también cuando solo
+                  esperaba a que terminara una tool, p.ej. la investigación del
+                  analizador), quedaba pegado justo arriba de la fila de tools y se leía
+                  como un "rectángulo negro" suelto. El reveal animado de Streamdown
+                  (isAnimating) y el shimmer de la fila de tools ya indican "en curso". */}
             </div>
           )
         ) : null}
@@ -352,14 +444,30 @@ export function AgentMessage({
         <ToolCallHistory
           canRespond={canRespond}
           isLatestMessage={isLatestMessage}
-          isStreaming={isStreaming}
           onInputResponses={onInputResponses}
           parts={toolParts}
         />
 
-        {otherParts.map((part, index) => (
-          <AgentMessagePart key={partKey(part, index)} part={part} />
-        ))}
+        {otherParts.map((part, index) => {
+          // Las URLs del CDN (marcadores `[Imagen adjunta: URL]`, ocultos arriba) van en el
+          // mismo orden que las imágenes adjuntas — la n-ésima imagen usa la n-ésima URL.
+          // Son las que abre el botón de descargar, en vez del Data URL gigante.
+          let href: string | undefined;
+          if (part.type === "file" && part.mediaType.startsWith("image/")) {
+            href = imageUrls[
+              otherParts
+                .slice(0, index)
+                .filter(
+                  (previous) =>
+                    previous.type === "file" &&
+                    previous.mediaType.startsWith("image/"),
+                ).length
+            ];
+          }
+          return (
+            <AgentMessagePart href={href} key={partKey(part, index)} part={part} />
+          );
+        })}
 
         {/* Sin etiqueta de rol ("Tú"/"Jelou"/"Escribiendo…") — la posición del mensaje
             (izquierda/derecha) y el estilo ya distinguen quién habla, sin necesidad de
@@ -395,6 +503,47 @@ export function AgentMessage({
  * si falla (red, backend caído, ClickHouse sin configurar) el botón sigue funcionando
  * igual, solo no queda registrado — nunca bloquea ni le muestra un error al usuario.
  */
+/**
+ * Copia `text` al portapapeles. Primero la Clipboard API moderna; si no está disponible
+ * o la rechaza, cae a un <textarea> temporal + document.execCommand("copy").
+ *
+ * El fallback importa por cómo se integra el widget: corre dentro de un <iframe> de otro
+ * dominio (ver public/widget-loader.js), y ahí navigator.clipboard.writeText solo
+ * funciona si el iframe tiene `allow="clipboard-write"` — sin eso se rechaza en silencio
+ * y el botón "Copiar" parecía no hacer nada. execCommand no depende de esa política (sí
+ * de que se llame desde un gesto del usuario, que acá es el click del botón).
+ */
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Cae al fallback de abajo.
+    }
+  }
+  if (typeof document === "undefined") return false;
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "0";
+  textarea.style.left = "0";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  const previousFocus = document.activeElement as HTMLElement | null;
+  try {
+    textarea.focus();
+    textarea.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    textarea.remove();
+    previousFocus?.focus?.();
+  }
+}
+
 function MessageActionsRow({
   eveSessionId,
   messageId,
@@ -417,17 +566,13 @@ function MessageActionsRow({
   useEffect(() => () => clearTimeout(copyTimeoutRef.current), []);
 
   const handleCopy = () => {
-    if (typeof navigator === "undefined" || !navigator.clipboard) return;
-    navigator.clipboard
-      .writeText(text)
-      .then(() => {
-        setCopied(true);
-        clearTimeout(copyTimeoutRef.current);
-        copyTimeoutRef.current = setTimeout(() => setCopied(false), 1500);
-      })
-      .catch(() => {
-        // Sin permiso de portapapeles u otro fallo silencioso: no bloquea nada.
-      });
+    void copyTextToClipboard(text).then((ok) => {
+      // Si ningún método funcionó no se marca como copiado: no bloquea nada ni miente.
+      if (!ok) return;
+      setCopied(true);
+      clearTimeout(copyTimeoutRef.current);
+      copyTimeoutRef.current = setTimeout(() => setCopied(false), 1500);
+    });
   };
 
   const sendFeedback = (rating: "down" | "up") => {
@@ -539,24 +684,27 @@ function isAlwaysVisibleToolPart(part: EveDynamicToolPart, isLatestMessage: bool
  * expandir (con sangría). Los que necesitan atención (error, pregunta sin responder)
  * nunca se esconden.
  *
- * Importante: se mantiene colapsado *también mientras isStreaming* a propósito. Cada
+ * Por defecto se mantiene colapsado *también mientras isStreaming* a propósito. Cada
  * tool call nuevo cambia el contenido del contenedor con scroll de toda la conversación
  * (Conversation, ver components/ai-elements/conversation.tsx); si en vez de una sola
  * línea se renderizara la lista completa creciendo con cada acción, cada cambio de
  * altura dispara de nuevo el auto-scroll — se sentía como que "saltaba" en cada paso del
  * agente en vez de una sola vez. Con una sola línea que solo cambia de texto (misma
  * altura), el auto-scroll no se re-dispara por cada acción.
+ *
+ * Eso sí, el usuario puede expandirlo en cualquier momento, también mientras el agente
+ * sigue buscando: si lo expande a propósito, se respeta (antes el click se ignoraba
+ * hasta que terminaba el streaming y la fila parecía "muerta" justo cuando más se
+ * quiere ver qué está consultando el agente).
  */
 function ToolCallHistory({
   canRespond,
   isLatestMessage,
-  isStreaming,
   onInputResponses,
   parts,
 }: {
   readonly canRespond: boolean;
   readonly isLatestMessage: boolean;
-  readonly isStreaming: boolean;
   readonly onInputResponses: (
     responses: readonly AgentInputResponse[],
   ) => void | Promise<void>;
@@ -570,13 +718,10 @@ function ToolCallHistory({
 
   const always = parts.filter((part) => isAlwaysVisibleToolPart(part, isLatestMessage));
   const collapsible = parts.filter((part) => !isAlwaysVisibleToolPart(part, isLatestMessage));
-  // Mientras isStreaming, ignora el `expanded` que el usuario haya elegido: si dejamos
-  // que la lista completa crezca en vivo mientras el agente sigue llamando tools, cada
-  // tool call nuevo cambia la altura del bloque y eso re-dispara el auto-scroll de
-  // Conversation en cada paso (justo lo que no queremos). El click en "expandir" durante
-  // el streaming igual queda guardado en el estado — apenas termina, se muestra
-  // expandido de una, sin más resizes intermedios mientras tanto.
-  const showCollapsed = (isStreaming || !expanded) && collapsible.length > 0;
+  // Solo el click del usuario abre el detalle (expanded); el streaming ya no lo
+  // bloquea. Si el usuario no lo expandió, sigue colapsado a una línea mientras el
+  // agente trabaja (ver el comentario de ToolCallHistory sobre el auto-scroll).
+  const showCollapsed = !expanded && collapsible.length > 0;
   const last = collapsible[collapsible.length - 1];
 
   return (
@@ -634,7 +779,13 @@ function ToolCallHistory({
   );
 }
 
-function AgentMessagePart({ part }: { readonly part: EveMessagePart }) {
+function AgentMessagePart({
+  href,
+  part,
+}: {
+  readonly href?: string;
+  readonly part: EveMessagePart;
+}) {
   switch (part.type) {
     case "step-start":
     case "text":
@@ -648,7 +799,7 @@ function AgentMessagePart({ part }: { readonly part: EveMessagePart }) {
         </Marker>
       );
     case "file":
-      return <AttachmentPart part={part} />;
+      return <AttachmentPart href={href} part={part} />;
     case "authorization":
       return <AuthorizationPrompt part={part} />;
     case "dynamic-tool":
@@ -660,7 +811,21 @@ function AgentMessagePart({ part }: { readonly part: EveMessagePart }) {
   }
 }
 
-function AttachmentPart({ part }: { readonly part: EveFilePart }) {
+function AttachmentPart({
+  href,
+  part,
+}: {
+  /** URL pública (CDN) a abrir; si falta se usa `part.url` (puede ser un Data URL). */
+  readonly href?: string;
+  readonly part: EveFilePart;
+}) {
+  const target = href ?? part.url;
+  const handleOpen = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (target?.startsWith("data:")) {
+      event.preventDefault();
+      void openDataUrlInNewTab(target);
+    }
+  };
   const label = part.filename ?? "Adjunto";
   const detail = [part.mediaType, formatBytes(part.size)]
     .filter(Boolean)
@@ -684,18 +849,28 @@ function AttachmentPart({ part }: { readonly part: EveFilePart }) {
           <AttachmentDescription>{detail}</AttachmentDescription>
         ) : null}
       </AttachmentContent>
-      {part.url ? (
+      {target ? (
         <AttachmentActions>
           <AttachmentAction asChild aria-label="Abrir adjunto">
-            <a href={part.url} rel="noreferrer" target="_blank">
+            <a
+              href={target}
+              onClick={handleOpen}
+              rel="noreferrer"
+              target="_blank"
+            >
               <DownloadIcon />
             </a>
           </AttachmentAction>
         </AttachmentActions>
       ) : null}
-      {part.url ? (
+      {target ? (
         <AttachmentTrigger asChild aria-label={label}>
-          <a href={part.url} rel="noreferrer" target="_blank" />
+          <a
+            href={target}
+            onClick={handleOpen}
+            rel="noreferrer"
+            target="_blank"
+          />
         </AttachmentTrigger>
       ) : null}
     </Attachment>

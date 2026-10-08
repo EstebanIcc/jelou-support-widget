@@ -31,6 +31,17 @@ const ChatWidget = dynamic(
 // existe específicamente para evitar que ese módulo se ejecute en el servidor).
 const WIDGET_STORAGE_KEY = "jelou-eve-agent:widget-chat";
 
+// Prueba de la integración real (loader + iframe) desde esta misma página — ver
+// loadEmbeddedWidget() más abajo y public/widget-loader.js.
+const EMBED_SCRIPT_ID = "jelou-widget-loader-test";
+const EMBED_CONTAINER_ID = "jelou-widget-container";
+
+type JelouWidgetApi = {
+  readonly close: () => void;
+  readonly open: () => void;
+  readonly toggle: () => void;
+};
+
 export function HomeExperience({
   email,
   name,
@@ -46,6 +57,10 @@ export function HomeExperience({
   // input — separados a propósito: cambiar el input no dispara nada hasta "Aplicar".
   const [sessionId, setSessionId] = useState(initialSessionId ?? "");
   const [sessionIdInput, setSessionIdInput] = useState(initialSessionId ?? "");
+  // true mientras el widget embebido de prueba (loader + iframe) está cargado. Se
+  // desmonta el ChatWidget directo de abajo mientras tanto: los dos usan la misma
+  // esquina de la pantalla y el mismo localStorage, y se pisarían.
+  const [embedded, setEmbedded] = useState(false);
 
   useEffect(() => {
     setTheme(loadAssistantTheme());
@@ -75,6 +90,35 @@ export function HomeExperience({
       window.localStorage.removeItem(WIDGET_STORAGE_KEY);
     }
     setSessionId(trimmed);
+  }
+
+  // Simula a un sitio externo que integra el widget con <script src="widget-loader.js">
+  // y data-open="true": el panel carga ya abierto, sin tocar el botón flotante. Es el
+  // mismo camino que usa producción (iframe a /widget + postMessage), no el ChatWidget
+  // directo que se renderiza abajo.
+  function loadEmbeddedWidget() {
+    if (typeof document === "undefined" || embedded) return;
+    const script = document.createElement("script");
+    script.id = EMBED_SCRIPT_ID;
+    script.src = "/widget-loader.js";
+    script.dataset.title = theme.title;
+    script.dataset.subtitle = theme.subtitle;
+    if (email) script.dataset.email = email;
+    if (sessionId) script.dataset.sessionId = sessionId;
+    script.dataset.open = "true";
+    document.body.appendChild(script);
+    setEmbedded(true);
+  }
+
+  function unloadEmbeddedWidget() {
+    document.getElementById(EMBED_SCRIPT_ID)?.remove();
+    document.getElementById(EMBED_CONTAINER_ID)?.remove();
+    delete (window as unknown as { JelouWidget?: JelouWidgetApi }).JelouWidget;
+    setEmbedded(false);
+  }
+
+  function callEmbeddedWidget(method: keyof JelouWidgetApi) {
+    (window as unknown as { JelouWidget?: JelouWidgetApi }).JelouWidget?.[method]();
   }
 
   function generateSessionId() {
@@ -274,16 +318,79 @@ export function HomeExperience({
             </code>
           </p>
         </section>
+
+        <section
+          aria-labelledby="embed-heading"
+          className="max-w-lg space-y-3 border-t border-border pt-8"
+        >
+          <div>
+            <h2
+              id="embed-heading"
+              className="text-lg font-semibold tracking-tight text-foreground"
+            >
+              Prueba de integración (iframe)
+            </h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Carga el widget como lo haría un sitio externo, con{" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                widget-loader.js
+              </code>{" "}
+              y{" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                data-open=&quot;true&quot;
+              </code>
+              : el panel aparece ya abierto, sin tocar el botón flotante. Mientras
+              esté cargado se oculta el widget directo de esta página.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {embedded ? (
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => callEmbeddedWidget("open")}
+                >
+                  JelouWidget.open()
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => callEmbeddedWidget("close")}
+                >
+                  JelouWidget.close()
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => callEmbeddedWidget("toggle")}
+                >
+                  JelouWidget.toggle()
+                </Button>
+                <Button type="button" onClick={unloadEmbeddedWidget}>
+                  Quitar widget embebido
+                </Button>
+              </>
+            ) : (
+              <Button type="button" onClick={loadEmbeddedWidget}>
+                Cargar widget ya abierto
+              </Button>
+            )}
+          </div>
+        </section>
       </main>
 
-      <ChatWidget
-        key={sessionId}
-        title={theme.title}
-        subtitle={theme.subtitle}
-        email={email}
-        name={name}
-        sessionId={sessionId}
-      />
+      {embedded ? null : (
+        <ChatWidget
+          key={sessionId}
+          title={theme.title}
+          subtitle={theme.subtitle}
+          email={email}
+          name={name}
+          sessionId={sessionId}
+        />
+      )}
     </div>
   );
 }
